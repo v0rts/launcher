@@ -3,24 +3,26 @@ package packaging
 import (
 	"bytes"
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"text/template"
 
 	"github.com/kolide/kit/fs"
 	"github.com/kolide/launcher/pkg/packagekit"
-	"github.com/kolide/launcher/pkg/packaging/internal"
 	"github.com/pkg/errors"
 	"go.opencensus.io/trace"
 )
 
-//go:generate go-bindata -nometadata -nocompress -pkg internal -o internal/assets.go internal/assets/
+//go:embed assets/*
+var assets embed.FS
 
 const (
 	// Enroll secret should be readable only by root
@@ -57,9 +59,12 @@ type PackageOptions struct {
 	WixSkipCleanup    bool
 	DisableService    bool
 
-	AppleSigningKey     string   // apple signing key
-	WindowsUseSigntool  bool     // whether to use signtool.exe on windows
-	WindowsSigntoolArgs []string // Extra args for signtool. May be needed for finding a key
+	AppleNotarizeAccountId   string   // The 10 character apple account id
+	AppleNotarizeAppPassword string   // app password for notarization service
+	AppleNotarizeUserId      string   // User id to authenticate to the notarization service with
+	AppleSigningKey          string   // apple signing key
+	WindowsSigntoolArgs      []string // Extra args for signtool. May be needed for finding a key
+	WindowsUseSigntool       bool     // whether to use signtool.exe on windows
 
 	target        Target                     // Target build platform
 	initOptions   *packagekit.InitOptions    // options we'll pass to the packagekit renderers
@@ -275,6 +280,10 @@ func (p *PackageOptions) Build(ctx context.Context, packageWriter io.Writer, tar
 		return errors.Wrapf(err, "setup init script for %s", p.target.String())
 	}
 
+	if err := p.setupPreinst(ctx); err != nil {
+		return errors.Wrapf(err, "setup preinst for %s", p.target.String())
+	}
+
 	if err := p.setupPostinst(ctx); err != nil {
 		return errors.Wrapf(err, "setup postInst for %s", p.target.String())
 	}
@@ -284,19 +293,22 @@ func (p *PackageOptions) Build(ctx context.Context, packageWriter io.Writer, tar
 	}
 
 	p.packagekitops = &packagekit.PackageOptions{
-		Name:                "launcher",
-		Identifier:          p.Identifier,
-		Root:                p.packageRoot,
-		Scripts:             p.scriptRoot,
-		AppleSigningKey:     p.AppleSigningKey,
-		WindowsUseSigntool:  p.WindowsUseSigntool,
-		WindowsSigntoolArgs: p.WindowsSigntoolArgs,
-		Version:             p.PackageVersion,
-		FlagFile:            p.canonicalizePath(flagFilePath),
-		WixPath:             p.WixPath,
-		WixUI:               p.MSIUI,
-		WixSkipCleanup:      p.WixSkipCleanup,
-		DisableService:      p.DisableService,
+		Name:                     "launcher",
+		Identifier:               p.Identifier,
+		Root:                     p.packageRoot,
+		Scripts:                  p.scriptRoot,
+		AppleNotarizeAccountId:   p.AppleNotarizeAccountId,
+		AppleNotarizeAppPassword: p.AppleNotarizeAppPassword,
+		AppleNotarizeUserId:      p.AppleNotarizeUserId,
+		AppleSigningKey:          p.AppleSigningKey,
+		WindowsUseSigntool:       p.WindowsUseSigntool,
+		WindowsSigntoolArgs:      p.WindowsSigntoolArgs,
+		Version:                  p.PackageVersion,
+		FlagFile:                 p.canonicalizePath(flagFilePath),
+		WixPath:                  p.WixPath,
+		WixUI:                    p.MSIUI,
+		WixSkipCleanup:           p.WixSkipCleanup,
+		DisableService:           p.DisableService,
 	}
 
 	if err := p.makePackage(ctx); err != nil {
@@ -443,9 +455,9 @@ func (p *PackageOptions) renderLogrotateConfig(ctx context.Context) error {
 		PidPath: filepath.Join(p.rootDir, "launcher.pid"),
 	}
 
-	logrotateTemplate, err := internal.Asset("internal/assets/logrotate.conf")
+	logrotateTemplate, err := assets.ReadFile("assets/logrotate.conf")
 	if err != nil {
-		return errors.Wrapf(err, "failed to get template named %s", "internal/assets/logrotate.conf")
+		return errors.Wrapf(err, "failed to get template named %s", "assets/logrotate.conf")
 	}
 
 	tmpl, err := template.New("logrotate").Parse(string(logrotateTemplate))
@@ -583,6 +595,22 @@ func (p *PackageOptions) setupPrerm(ctx context.Context) error {
 	return nil
 }
 
+func (p *PackageOptions) setupPreinst(ctx context.Context) error {
+	if p.target.Platform != Darwin {
+		return nil
+	}
+
+	preinstallContent, err := assets.ReadFile("assets/preinstall-darwin.sh")
+	if err != nil {
+		return errors.Wrap(err, "getting template for preinstall")
+	}
+
+	return errors.Wrap(
+		ioutil.WriteFile(filepath.Join(p.scriptRoot, "preinstall"), preinstallContent, 0755),
+		"writing preinstall file",
+	)
+}
+
 func (p *PackageOptions) setupPostinst(ctx context.Context) error {
 	if p.target.Init == NoInit {
 		return nil
@@ -592,13 +620,13 @@ func (p *PackageOptions) setupPostinst(ctx context.Context) error {
 
 	switch {
 	case p.target.Platform == Darwin && p.target.Init == LaunchD:
-		postinstTemplateName = "internal/assets/postinstall-launchd.sh"
+		postinstTemplateName = "postinstall-launchd.sh"
 	case p.target.Platform == Linux && p.target.Init == Systemd:
-		postinstTemplateName = "internal/assets/postinstall-systemd.sh"
+		postinstTemplateName = "postinstall-systemd.sh"
 	case p.target.Platform == Linux && (p.target.Init == Upstart || p.target.Init == UpstartAmazonAMI):
-		postinstTemplateName = "internal/assets/postinstall-upstart.sh"
+		postinstTemplateName = "postinstall-upstart.sh"
 	case p.target.Platform == Linux && p.target.Init == Init:
-		postinstTemplateName = "internal/assets/postinstall-init.sh"
+		postinstTemplateName = "postinstall-init.sh"
 	default:
 		// If we don't match in the case statement, log that we're ignoring
 		// the setup, and move on. Don't throw an error.
@@ -606,7 +634,7 @@ func (p *PackageOptions) setupPostinst(ctx context.Context) error {
 		return nil
 	}
 
-	postinstTemplate, err := internal.Asset(postinstTemplateName)
+	postinstTemplate, err := assets.ReadFile(path.Join("assets", postinstTemplateName))
 	if err != nil {
 		return errors.Wrapf(err, "Failed to get template named %s", postinstTemplateName)
 	}

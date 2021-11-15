@@ -22,6 +22,7 @@ const (
 	ExecType
 	XmlType
 	IniType
+	KeyValueType
 )
 
 type Table struct {
@@ -33,6 +34,19 @@ type Table struct {
 
 	execDataFunc func([]byte, ...dataflatten.FlattenOpts) ([]dataflatten.Row, error)
 	execArgs     []string
+	binDirs      []string
+
+	keyValueSeparator string
+}
+
+// AllTablePlugins is a helper to return all the expected flattening tables.
+func AllTablePlugins(client *osquery.ExtensionManagerClient, logger log.Logger) []*table.Plugin {
+	return []*table.Plugin{
+		TablePlugin(client, logger, JsonType),
+		TablePlugin(client, logger, XmlType),
+		TablePlugin(client, logger, IniType),
+		TablePlugin(client, logger, PlistType),
+	}
 }
 
 func TablePlugin(client *osquery.ExtensionManagerClient, logger log.Logger, dataSourceType DataSourceType) *table.Plugin {
@@ -97,16 +111,9 @@ func (t *Table) generate(ctx context.Context, queryContext table.QueryContext) (
 
 func (t *Table) generatePath(filePath string, dataQuery string) ([]map[string]string, error) {
 	flattenOpts := []dataflatten.FlattenOpts{
+		dataflatten.WithLogger(t.logger),
 		dataflatten.WithNestedPlist(),
-	}
-
-	if t.logger != nil {
-		// dataflatten is noisy, so unless we're not debugging it, filter it to info
-		flattenOpts = append(flattenOpts, dataflatten.WithLogger(level.NewFilter(t.logger, level.AllowInfo())))
-	}
-
-	if dataQuery != "" {
-		flattenOpts = append(flattenOpts, dataflatten.WithQuery(strings.Split(dataQuery, "/")))
+		dataflatten.WithQuery(strings.Split(dataQuery, "/")),
 	}
 
 	data, err := t.dataFunc(filePath, flattenOpts...)

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver"
+	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/kit/fs"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
@@ -39,19 +40,29 @@ import (
 )
 
 type Builder struct {
-	os           string
-	arch         string
-	static       bool
-	race         bool
-	stampVersion bool
-	fakedata     bool
+	os                 string
+	arch               string
+	goVer              string
+	goPath             string
+	static             bool
+	race               bool
+	stampVersion       bool
+	fakedata           bool
+	notStripped        bool
+	cgo                bool
+	githubActionOutput bool
 
-	goVer  *semver.Version
 	cmdEnv []string
 	execCC func(context.Context, string, ...string) *exec.Cmd
 }
 
 type Option func(*Builder)
+
+func WithGoPath(goPath string) Option {
+	return func(b *Builder) {
+		b.goPath = goPath
+	}
+}
 
 func WithOS(o string) Option {
 	return func(b *Builder) {
@@ -65,9 +76,21 @@ func WithArch(a string) Option {
 	}
 }
 
+func WithCgo() Option {
+	return func(b *Builder) {
+		b.cgo = true
+	}
+}
+
 func WithStatic() Option {
 	return func(b *Builder) {
 		b.static = true
+	}
+}
+
+func WithOutStripped() Option {
+	return func(b *Builder) {
+		b.notStripped = true
 	}
 }
 
@@ -89,17 +112,18 @@ func WithFakeData() Option {
 	}
 }
 
-func New(opts ...Option) (*Builder, error) {
-	verString := strings.TrimPrefix(runtime.Version(), "go")
-	goVer, err := semver.NewVersion(verString)
-	if err != nil {
-		return nil, errors.Wrapf(err, "parse go version %q as semver", verString)
+func WithGithubActionOutput() Option {
+	return func(b *Builder) {
+		b.githubActionOutput = true
 	}
+}
 
+func New(opts ...Option) *Builder {
 	b := Builder{
-		os:    runtime.GOOS,
-		arch:  runtime.GOARCH,
-		goVer: goVer,
+		os:     runtime.GOOS,
+		arch:   runtime.GOARCH,
+		goPath: "go",
+		goVer:  strings.TrimPrefix(runtime.Version(), "go"),
 
 		execCC: exec.CommandContext,
 	}
@@ -113,43 +137,92 @@ func New(opts ...Option) (*Builder, error) {
 	cmdEnv = append(cmdEnv, "GO111MODULE=on")
 	cmdEnv = append(cmdEnv, fmt.Sprintf("GOOS=%s", b.os))
 	cmdEnv = append(cmdEnv, fmt.Sprintf("GOARCH=%s", b.arch))
+
+	if b.cgo {
+		cmdEnv = append(cmdEnv, "CGO_ENABLED=1")
+	}
+
+	// Setup zig as cross compiler
+	// (This is mostly to support fscrypt on linux)
+	if b.os != runtime.GOOS {
+		cwd, err := os.Getwd()
+		if err != nil {
+			// panic here feels a little uncouth, but the
+			// caller here is a bunch simpler if we can
+			// return *Builder, and this error is
+			// exceedingly unlikely.
+			panic(fmt.Sprintf("Unable to get cwd: %s", err))
+		}
+
+		cmdEnv = append(
+			cmdEnv,
+			fmt.Sprintf("ZIGTARGET=%s", zigTarget(b.os, b.arch)),
+			fmt.Sprintf("CC=%s", filepath.Join(cwd, "tools", "zcc")),
+			fmt.Sprintf("CXX=%s", filepath.Join(cwd, "tools", "zxx")),
+		)
+	}
+
+	// I don't remember remember why we do this, but it might
+	// break linux, as we need CGO for fscrypt
 	if b.static {
 		cmdEnv = append(cmdEnv, "CGO_ENABLED=0")
 	}
 
 	b.cmdEnv = cmdEnv
 
-	return &b, nil
-
+	return &b
 }
 
-// PlatformExtensionName is a helper to return the platform specific extension name.
-func (b *Builder) PlatformExtensionName(input string) string {
-	input = filepath.Join("build", b.os, input)
-	if b.os == "windows" {
-		return input + ".exe"
-	} else {
-		return input + ".ext"
+func zigTarget(goos, goarch string) string {
+	switch goarch {
+	case "amd64":
+		goarch = "x86_64"
+	case "arm64":
+		goarch = "aarch64"
 	}
+
+	if goos == "darwin" {
+		goos = "macos"
+	}
+
+	return fmt.Sprintf("%s-%s", goarch, goos)
 }
 
-// PlatformBinaryName is a helper to return the platform specific binary suffix.
+// PlatformBinaryName is a helper to return the platform specific output path.
 func (b *Builder) PlatformBinaryName(input string) string {
-	input = filepath.Join("build", b.os, input)
+	// On windows, everything must end in .exe. Strip off the extension
+	// suffix, if present, and add .exe
 	if b.os == "windows" {
-		return input + ".exe"
+		input = strings.TrimSuffix(input, ".ext") + ".exe"
 	}
-	return input
+
+	platformName := fmt.Sprintf("%s.%s", b.os, b.arch)
+
+	return filepath.Join("build", platformName, input)
 }
 
-func (b *Builder) goVersionCompatible() error {
-	if b.goVer == nil {
+func (b *Builder) goVersionCompatible(logger log.Logger) error {
+	if b.goVer == "" {
 		return errors.New("no go version. Is this a bad mock?")
 	}
+
+	if strings.HasPrefix(b.goVer, "devel") {
+		level.Info(logger).Log(
+			"msg", "Skipping version check for development version",
+			"version", b.goVer,
+		)
+		return nil
+	}
+
+	goVer, err := semver.NewVersion(b.goVer)
+	if err != nil {
+		return errors.Wrapf(err, "parse go version %q as semver", b.goVer)
+	}
+
 	goConstraint := ">= 1.11"
 	c, _ := semver.NewConstraint(goConstraint)
-	if !c.Check(b.goVer) {
-		return errors.Errorf("project requires Go version %s, have %s", goConstraint, b.goVer)
+	if !c.Check(goVer) {
+		return errors.Errorf("project requires Go version %s, have %s", goConstraint, goVer)
 	}
 	return nil
 }
@@ -165,7 +238,7 @@ func (b *Builder) DepsGo(ctx context.Context) error {
 		"msg", "Starting",
 	)
 
-	if err := b.goVersionCompatible(); err != nil {
+	if err := b.goVersionCompatible(logger); err != nil {
 		return err
 	}
 	cmd := b.execCC(ctx, "go", "mod", "download")
@@ -378,9 +451,9 @@ func bootstrapFromNotary(notaryConfigDir, remoteServerURL, localRepo, gun string
 	return nil
 }
 
-func (b *Builder) BuildCmd(src, output string) func(context.Context) error {
+func (b *Builder) BuildCmd(src, appName string) func(context.Context) error {
 	return func(ctx context.Context) error {
-		_, appName := filepath.Split(output)
+		output := b.PlatformBinaryName(appName)
 
 		ctx, span := trace.StartSpan(ctx, fmt.Sprintf("make.BuildCmd.%s", appName))
 		defer span.End()
@@ -406,8 +479,13 @@ func (b *Builder) BuildCmd(src, output string) func(context.Context) error {
 
 		var ldFlags []string
 		if b.static {
-			ldFlags = append(ldFlags, "-w -d -linkmode internal")
+			ldFlags = append(ldFlags, "-d -linkmode internal")
 		}
+
+		if !b.notStripped {
+			ldFlags = append(ldFlags, "-w -s")
+		}
+
 		if b.stampVersion {
 			v, err := b.getVersion(ctx)
 			if err != nil {
@@ -450,27 +528,41 @@ func (b *Builder) BuildCmd(src, output string) func(context.Context) error {
 		}
 		args := append(baseArgs, src)
 
-		level.Debug(ctxlog.FromContext(ctx)).Log("mgs", "building binary", "app_name", appName, "output", output, "go_args", strings.Join(args, "  "))
-
-		cmd := b.execCC(ctx, "go", args...)
+		cmd := b.execCC(ctx, b.goPath, args...)
 		cmd.Env = append(cmd.Env, b.cmdEnv...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
+
+		level.Debug(ctxlog.FromContext(ctx)).Log(
+			"mgs", "building binary",
+			"app_name", appName,
+			"output", output,
+			"go_args", strings.Join(args, "  "),
+			"env", fmt.Sprintf("%v", cmd.Env),
+		)
+
 		if err := cmd.Run(); err != nil {
 			return err
+		}
+
+		// Tell github where we're at
+		if b.githubActionOutput {
+			fmt.Printf("::set-output name=binary::%s\n", output)
 		}
 
 		// all the builds go to `build/<os>/binary`, but if the build OS is the same as the target OS,
 		// we also want to hardlink the resulting binary at the root of `build/` for convenience.
 		// ex: running ./build/launcher on macos instead of ./build/darwin/launcher
-		if b.os == runtime.GOOS {
-			platformPath := filepath.Join("build", appName)
-			if err := os.Remove(platformPath); err != nil && !os.IsNotExist(err) {
+		if b.os == runtime.GOOS && b.arch == runtime.GOARCH {
+			_, binName := filepath.Split(output)
+			symlinkTarget := filepath.Join("build", binName)
+
+			if err := os.Remove(symlinkTarget); err != nil && !os.IsNotExist(err) {
 				// log but don't fail. This could happen if for example ./build/launcher.exe is referenced by a running service.
 				// if this becomes clearer, we can either return an error here, or go back to silently ignoring.
 				level.Debug(ctxlog.FromContext(ctx)).Log("msg", "remove before hardlink failed", "err", err, "app_name", appName)
 			}
-			return os.Link(output, platformPath)
+			return os.Link(output, symlinkTarget)
 		}
 		return nil
 	}

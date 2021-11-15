@@ -1,4 +1,5 @@
-//+build darwin
+//go:build darwin
+// +build darwin
 
 // Package ioreg provides a table wrapper around the `ioreg` macOS
 // command.
@@ -10,11 +11,8 @@
 package ioreg
 
 import (
-	"bytes"
 	"context"
-	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -23,7 +21,6 @@ import (
 	"github.com/kolide/launcher/pkg/osquery/tables/tablehelpers"
 	"github.com/kolide/osquery-go"
 	"github.com/kolide/osquery-go/plugin/table"
-	"github.com/pkg/errors"
 )
 
 const ioregPath = "/usr/sbin/ioreg"
@@ -68,7 +65,8 @@ func (t *Table) generate(ctx context.Context, queryContext table.QueryContext) (
 	}
 
 	for _, ioC := range tablehelpers.GetConstraints(queryContext, "c", gcOpts...) {
-		ioregArgs := []string{}
+		// We always need "-a", it's the "archive" output
+		ioregArgs := []string{"-a"}
 
 		if ioC != "" {
 			ioregArgs = append(ioregArgs, "-c", ioC)
@@ -107,7 +105,7 @@ func (t *Table) generate(ctx context.Context, queryContext table.QueryContext) (
 							for _, dataQuery := range tablehelpers.GetConstraints(queryContext, "query", tablehelpers.WithDefaults("*")) {
 								// Finally, an inner loop
 
-								ioregOutput, err := t.execIoreg(ctx, ioregArgs)
+								ioregOutput, err := tablehelpers.Exec(ctx, t.logger, 30, []string{ioregPath}, ioregArgs)
 								if err != nil {
 									level.Info(t.logger).Log("msg", "ioreg failed", "err", err)
 									continue
@@ -141,39 +139,10 @@ func (t *Table) generate(ctx context.Context, queryContext table.QueryContext) (
 }
 
 func (t *Table) flattenOutput(dataQuery string, systemOutput []byte) ([]dataflatten.Row, error) {
-	flattenOpts := []dataflatten.FlattenOpts{}
-
-	if dataQuery != "" {
-		flattenOpts = append(flattenOpts, dataflatten.WithQuery(strings.Split(dataQuery, "/")))
-	}
-
-	if t.logger != nil {
-		flattenOpts = append(flattenOpts,
-			dataflatten.WithLogger(level.NewFilter(t.logger, level.AllowInfo())),
-		)
+	flattenOpts := []dataflatten.FlattenOpts{
+		dataflatten.WithLogger(t.logger),
+		dataflatten.WithQuery(strings.Split(dataQuery, "/")),
 	}
 
 	return dataflatten.Plist(systemOutput, flattenOpts...)
-}
-
-func (t *Table) execIoreg(ctx context.Context, args []string) ([]byte, error) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
-	args = append(args, "-a")
-
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, ioregPath, args...)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	level.Debug(t.logger).Log("msg", "calling ioreg", "args", cmd.Args)
-
-	if err := cmd.Run(); err != nil {
-		return nil, errors.Wrapf(err, "calling ioreg. Got: %s", string(stderr.Bytes()))
-	}
-
-	return stdout.Bytes(), nil
 }

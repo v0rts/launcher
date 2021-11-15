@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 // Package wmi provides a basic interface for querying against
@@ -41,6 +42,7 @@ import (
 	"github.com/go-ole/go-ole/oleutil"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 	"github.com/pkg/errors"
+	"github.com/scjalliance/comshim"
 )
 
 // S_FALSE is returned by CoInitializeEx if it was already called on this thread.
@@ -133,14 +135,8 @@ func Query(ctx context.Context, className string, properties []string, opts ...O
 	queryString := fmt.Sprintf("SELECT * FROM %s%s", className, whereClause)
 
 	// Initialize the COM system.
-	if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
-		oleCode := err.(*ole.OleError).Code()
-		if oleCode != ole.S_OK && oleCode != S_FALSE {
-			return nil, errors.Wrap(err, "CoInitialize returned error")
-		}
-		level.Debug(logger).Log("msg", "The COM library is already initialized on this thread")
-	}
-	defer ole.CoUninitialize()
+	comshim.Add(1)
+	defer comshim.Done()
 
 	unknown, err := oleutil.CreateObject("WbemScripting.SWbemLocator")
 	if err != nil {
@@ -211,13 +207,23 @@ func (oh *oleHandler) HandleVariant(v *ole.VARIANT) error {
 		}
 		defer val.Clear()
 
-		// Not sure if we need to special case the nil, or iv Value() handles it.
+		// Not sure if we need to special case the nil, or if Value() handles it.
 		if val.VT == 0x1 { //VT_NULL
 			result[p] = nil
 			continue
 		}
 
-		result[p] = val.Value()
+		// Attempt to handle arrays
+		safeArray := val.ToArray()
+		if safeArray != nil {
+			// I would have expected to need
+			// `defersafeArray.Release()` here, if I add
+			// that, this routine stops working.
+			result[p] = safeArray.ToValueArray()
+		} else {
+			result[p] = val.Value()
+		}
+
 	}
 	if len(result) > 0 {
 		oh.results = append(oh.results, result)

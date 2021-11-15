@@ -53,6 +53,8 @@ import (
 	"golang.org/x/image/tiff"
 )
 
+var crcTable = crc64.MakeTable(crc64.ECMA)
+
 func UserAvatar(logger log.Logger) *table.Plugin {
 	columns := []table.ColumnDefinition{
 		table.TextColumn("username"),
@@ -78,7 +80,7 @@ func (t *userAvatarTable) generateAvatars(ctx context.Context, queryContext tabl
 	} else {
 		usernamesString := C.LocalUsers()
 		for _, posixName := range strings.Split(C.GoString(usernamesString), " ") {
-			usernames = append(usernames, string(posixName))
+			usernames = append(usernames, posixName)
 		}
 	}
 

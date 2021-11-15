@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/kit/fs"
@@ -26,6 +25,7 @@ import (
 	"github.com/kolide/launcher/pkg/service"
 	"github.com/oklog/run"
 	"github.com/pkg/errors"
+	"go.etcd.io/bbolt"
 )
 
 // runLauncher is the entry point into running launcher. It creates a
@@ -80,8 +80,8 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 	// this. Note that the timeout is documented as failing
 	// unimplemented on windows, though empirically it seems to
 	// work.
-	boltOptions := &bolt.Options{Timeout: time.Duration(30) * time.Second}
-	db, err := bolt.Open(filepath.Join(rootDirectory, "launcher.db"), 0600, boltOptions)
+	boltOptions := &bbolt.Options{Timeout: time.Duration(30) * time.Second}
+	db, err := bbolt.Open(filepath.Join(rootDirectory, "launcher.db"), 0600, boltOptions)
 	if err != nil {
 		return errors.Wrap(err, "open launcher db")
 	}
@@ -173,7 +173,7 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 
 	// If the autoupdater is enabled, enable it for both osquery and launcher
 	if opts.Autoupdate {
-		config := &updaterConfig{
+		osqueryUpdaterconfig := &updaterConfig{
 			Logger:             logger,
 			RootDirectory:      rootDirectory,
 			AutoupdateInterval: opts.AutoupdateInterval,
@@ -182,15 +182,29 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 			MirrorURL:          opts.MirrorServerURL,
 			NotaryPrefix:       opts.NotaryPrefix,
 			HTTPClient:         httpClient,
+			InitialDelay:       opts.AutoupdateInitialDelay + opts.AutoupdateInterval/2,
 			SigChannel:         sigChannel,
 		}
 
 		// create an updater for osquery
-		osqueryUpdater, err := createUpdater(ctx, opts.OsquerydPath, runnerRestart, config)
+		osqueryUpdater, err := createUpdater(ctx, opts.OsquerydPath, runnerRestart, osqueryUpdaterconfig)
 		if err != nil {
 			return errors.Wrap(err, "create osquery updater")
 		}
 		runGroup.Add(osqueryUpdater.Execute, osqueryUpdater.Interrupt)
+
+		launcherUpdaterconfig := &updaterConfig{
+			Logger:             logger,
+			RootDirectory:      rootDirectory,
+			AutoupdateInterval: opts.AutoupdateInterval,
+			UpdateChannel:      opts.UpdateChannel,
+			NotaryURL:          opts.NotaryServerURL,
+			MirrorURL:          opts.MirrorServerURL,
+			NotaryPrefix:       opts.NotaryPrefix,
+			HTTPClient:         httpClient,
+			InitialDelay:       opts.AutoupdateInitialDelay,
+			SigChannel:         sigChannel,
+		}
 
 		// create an updater for launcher
 		launcherPath, err := os.Executable()
@@ -201,7 +215,7 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 			ctx,
 			launcherPath,
 			updateFinalizer(logger, runnerShutdown),
-			config,
+			launcherUpdaterconfig,
 		)
 		if err != nil {
 			return errors.Wrap(err, "create launcher updater")

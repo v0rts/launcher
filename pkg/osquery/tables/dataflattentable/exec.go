@@ -3,8 +3,11 @@ package dataflattentable
 import (
 	"bytes"
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -14,14 +17,35 @@ import (
 	"github.com/pkg/errors"
 )
 
-func TablePluginExec(client *osquery.ExtensionManagerClient, logger log.Logger, tableName string, dataSourceType DataSourceType, execArgs []string) *table.Plugin {
+type ExecTableOpt func(*Table)
+
+// WithKVSeparator sets the delimiter between key and value. It replaces the
+// default ":" in dataflattentable.Table
+func WithKVSeparator(separator string) ExecTableOpt {
+	return func(t *Table) {
+		t.keyValueSeparator = separator
+	}
+}
+
+func WithBinDirs(binDirs ...string) ExecTableOpt {
+	return func(t *Table) {
+		t.binDirs = binDirs
+	}
+}
+
+func TablePluginExec(client *osquery.ExtensionManagerClient, logger log.Logger, tableName string, dataSourceType DataSourceType, execArgs []string, opts ...ExecTableOpt) *table.Plugin {
 	columns := Columns()
 
 	t := &Table{
-		client:    client,
-		logger:    level.NewFilter(logger, level.AllowInfo()),
-		tableName: tableName,
-		execArgs:  execArgs,
+		client:            client,
+		logger:            level.NewFilter(logger, level.AllowInfo()),
+		tableName:         tableName,
+		execArgs:          execArgs,
+		keyValueSeparator: ":",
+	}
+
+	for _, opt := range opts {
+		opt(t)
 	}
 
 	switch dataSourceType {
@@ -29,6 +53,10 @@ func TablePluginExec(client *osquery.ExtensionManagerClient, logger log.Logger, 
 		t.execDataFunc = dataflatten.Plist
 	case JsonType:
 		t.execDataFunc = dataflatten.Json
+	case KeyValueType:
+		// TODO: allow callers of TablePluginExec to specify the record
+		// splitting strategy
+		t.execDataFunc = dataflatten.StringDelimitedFunc(t.keyValueSeparator, dataflatten.DuplicateKeys)
 	default:
 		panic("Unknown data source type")
 	}
@@ -57,31 +85,48 @@ func (t *Table) generateExec(ctx context.Context, queryContext table.QueryContex
 }
 
 func (t *Table) exec(ctx context.Context) ([]byte, error) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(ctx, 50*time.Second)
+	defer cancel()
 
-	cmd := exec.CommandContext(ctx, t.execArgs[0], t.execArgs[1:]...)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	possibleBinaries := []string{}
 
-	level.Debug(t.logger).Log("msg", "calling %s", "args", t.execArgs[0], cmd.Args)
-
-	if err := cmd.Run(); err != nil {
-		return nil, errors.Wrapf(err, "calling %s. Got: %s", t.execArgs[0], string(stderr.Bytes()))
+	if t.binDirs == nil || len(t.binDirs) == 0 {
+		possibleBinaries = []string{t.execArgs[0]}
+	} else {
+		for _, possiblePath := range t.binDirs {
+			possibleBinaries = append(possibleBinaries, filepath.Join(possiblePath, t.execArgs[0]))
+		}
 	}
 
-	return stdout.Bytes(), nil
+	for _, execPath := range possibleBinaries {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+
+		cmd := exec.CommandContext(ctx, execPath, t.execArgs[1:]...)
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		level.Debug(t.logger).Log("msg", "calling %s", "args", cmd.String())
+
+		if err := cmd.Run(); os.IsNotExist(err) {
+			// try the next binary
+			continue
+		} else if err != nil {
+			return nil, errors.Wrapf(err, "calling %s. Got: %s", t.execArgs[0], string(stderr.Bytes()))
+		}
+
+		// success!
+		return stdout.Bytes(), nil
+	}
+
+	// None of the possible execs were found
+	return nil, errors.Errorf("Unable to exec '%s'. No binary found is specified paths", t.execArgs[0])
 }
 
 func (t *Table) getRowsFromOutput(dataQuery string, execOutput []byte) []map[string]string {
-	flattenOpts := []dataflatten.FlattenOpts{}
-
-	if dataQuery != "" {
-		flattenOpts = append(flattenOpts, dataflatten.WithQuery(strings.Split(dataQuery, "/")))
-	}
-
-	if t.logger != nil {
-		flattenOpts = append(flattenOpts, dataflatten.WithLogger(t.logger))
+	flattenOpts := []dataflatten.FlattenOpts{
+		dataflatten.WithLogger(t.logger),
+		dataflatten.WithQuery(strings.Split(dataQuery, "/")),
 	}
 
 	data, err := t.execDataFunc(execOutput, flattenOpts...)

@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io/ioutil"
 
-	"github.com/boltdb/bolt"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/kit/actor"
+	"github.com/kolide/launcher/pkg/augeas"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 	"github.com/kolide/launcher/pkg/launcher"
 	kolidelog "github.com/kolide/launcher/pkg/log"
@@ -21,10 +21,12 @@ import (
 	"github.com/kolide/osquery-go/plugin/distributed"
 	osquerylogger "github.com/kolide/osquery-go/plugin/logger"
 	"github.com/pkg/errors"
+	"go.etcd.io/bbolt"
 )
 
-// TODO: the extension, runtime, and client are all kind of entangled here. Untangle the underlying libraries and separate into units
-func createExtensionRuntime(ctx context.Context, db *bolt.DB, launcherClient service.KolideService, opts *launcher.Options) (
+// TODO: the extension, runtime, and client are all kind of entangled
+// here. Untangle the underlying libraries and separate into units
+func createExtensionRuntime(ctx context.Context, db *bbolt.DB, launcherClient service.KolideService, opts *launcher.Options) (
 	run *actor.Actor,
 	restart func() error, // restart osqueryd runner
 	shutdown func() error, // shutdown osqueryd runner
@@ -50,6 +52,29 @@ func createExtensionRuntime(ctx context.Context, db *bolt.DB, launcherClient ser
 		Logger:                            logger,
 		LoggingInterval:                   opts.LoggingInterval,
 		RunDifferentialQueriesImmediately: opts.EnableInitialRunner,
+	}
+
+	// Setting MaxBytesPerBatch is a tradeoff. If it's too low, we
+	// can never send a large result. But if it's too high, we may
+	// not be able to send the data over a low bandwidth
+	// connection before the connection is timed out.
+	//
+	// The logic for setting this is spread out. The underlying
+	// extension defaults to 3mb, to support GRPC's hardcoded 4MB
+	// limit. But as we're transport aware here. we can set it to
+	// 5MB for others.
+	if opts.LogMaxBytesPerBatch != 0 {
+		if opts.Transport == "grpc" && opts.LogMaxBytesPerBatch > 3 {
+			level.Info(logger).Log(
+				"msg", "LogMaxBytesPerBatch is set above the grpc recommended maximum of 3. Expect errors",
+				"LogMaxBytesPerBatch", opts.LogMaxBytesPerBatch,
+			)
+		}
+		extOpts.MaxBytesPerBatch = opts.LogMaxBytesPerBatch << 20
+	} else if opts.Transport == "grpc" {
+		extOpts.MaxBytesPerBatch = 3 << 20
+	} else if opts.Transport != "grpc" {
+		extOpts.MaxBytesPerBatch = 5 << 20
 	}
 
 	// create the extension
@@ -89,6 +114,7 @@ func createExtensionRuntime(ctx context.Context, db *bolt.DB, launcherClient ser
 		runtime.WithLogger(logger),
 		runtime.WithOsqueryVerbose(opts.OsqueryVerbose),
 		runtime.WithOsqueryFlags(opts.OsqueryFlags),
+		runtime.WithAugeasLensFunction(augeas.InstallLenses),
 	)
 
 	restartFunc := func() error {

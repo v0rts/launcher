@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package wmi
@@ -79,6 +80,12 @@ func TestQuery(t *testing.T) {
 			class:      "Win32_OperatingSystem",
 			properties: []string{"name", "version"},
 			options:    []Option{ConnectNamespace(`root\cimv2`)},
+			minRows:    1,
+		},
+		{
+			name:       "wmi properties with an array",
+			class:      "Win32_SystemEnclosure",
+			properties: []string{"ChassisTypes"},
 			minRows:    1,
 		},
 		{

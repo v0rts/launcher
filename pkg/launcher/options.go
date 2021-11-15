@@ -35,6 +35,10 @@ type Options struct {
 	// Transport the transport that should be used for remote
 	// communication.
 	Transport string
+	// LogMaxBytesPerBatch sets the maximum bytes allowed in a batch
+	// of log. When blank, launcher will pick a value
+	// appropriate for the transport.
+	LogMaxBytesPerBatch int
 
 	// Control enables the remote control functionality.
 	Control bool
@@ -54,6 +58,8 @@ type Options struct {
 	UpdateChannel autoupdate.UpdateChannel
 	// NotaryPrefix is the path prefix used to store launcher and osqueryd binaries on the Notary server
 	NotaryPrefix string
+	// AutoupdateInitialDelay set an initial startup delay on the autoupdater process.
+	AutoupdateInitialDelay time.Duration
 
 	// Debug enables debug logging.
 	Debug bool

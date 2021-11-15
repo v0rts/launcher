@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/Masterminds/semver"
+	"github.com/go-kit/kit/log"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,26 +36,26 @@ func TestNamingHelpers(t *testing.T) {
 	}{
 		{
 			platform:     "linux",
-			extensionOut: "build/linux/test.ext",
-			binaryOut:    "build/linux/test",
+			extensionOut: "build/linux.amd64/test.ext",
+			binaryOut:    "build/linux.amd64/test",
 		},
 		{
 			platform:     "windows",
-			extensionOut: "build/windows/test.exe",
-			binaryOut:    "build/windows/test.exe",
+			extensionOut: "build/windows.amd64/test.exe",
+			binaryOut:    "build/windows.amd64/test.exe",
 		},
 		{
 			platform:     "darwin",
-			extensionOut: "build/darwin/test.ext",
-			binaryOut:    "build/darwin/test",
+			extensionOut: "build/darwin.amd64/test.ext",
+			binaryOut:    "build/darwin.amd64/test",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run("platform="+tt.platform, func(t *testing.T) {
-			b := Builder{os: tt.platform}
+			b := Builder{os: tt.platform, arch: "amd64"}
 			require.Equal(t, filepath.Clean(tt.binaryOut), b.PlatformBinaryName("test"))
-			require.Equal(t, filepath.Clean(tt.extensionOut), b.PlatformExtensionName("test"))
+			require.Equal(t, filepath.Clean(tt.extensionOut), b.PlatformBinaryName("test.ext"))
 		})
 	}
 }
@@ -82,14 +82,15 @@ func TestGoVersionCompatible(t *testing.T) {
 			ver:    "1.12",
 			passes: true,
 		},
+		{
+			ver:    "devel +e012d0dc34",
+			passes: true,
+		},
 	}
 
 	for _, tt := range tests {
-		semVer, err := semver.NewVersion(tt.ver)
-		require.NoError(t, err)
-
-		b := Builder{goVer: semVer}
-		err = b.goVersionCompatible()
+		b := Builder{goVer: tt.ver}
+		err := b.goVersionCompatible(log.NewNopLogger())
 		if tt.passes {
 			require.NoError(t, err)
 		} else {
@@ -103,14 +104,10 @@ func TestDepsGo(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	semVer, err := semver.NewVersion("1.11")
-	require.NoError(t, err)
-
-	b := Builder{goVer: semVer}
+	b := Builder{goVer: "1.11"}
 	b.execCC = helperCommandContext
 
-	err = b.DepsGo(ctx)
-	require.NoError(t, err)
+	require.NoError(t, b.DepsGo(ctx))
 }
 
 func TestExecOut(t *testing.T) {

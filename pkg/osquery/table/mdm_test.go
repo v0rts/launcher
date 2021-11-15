@@ -1,8 +1,10 @@
+//go:build darwin
 // +build darwin
 
 package table
 
 import (
+	"context"
 	"testing"
 
 	"github.com/kolide/kit/env"
@@ -11,9 +13,9 @@ import (
 
 func TestMDMProfileStatus(t *testing.T) {
 	if env.Bool("SKIP_TEST_MDM", true) {
-		t.Skip("No docker")
+		t.Skip("Skipping MDM Test")
 	}
 
-	_, err := getMDMProfileStatus()
+	_, err := getMDMProfileStatus(context.TODO())
 	require.Nil(t, err)
 }
