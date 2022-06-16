@@ -36,7 +36,7 @@ endif
 
 build_%: TARGET =  $(word 2, $(subst _, ,$@))
 build_%: OS = $(word 3, $(subst _, ,$@))
-build_%: OSARG = $(if $(OS), --os $(OS))
+build_%: OSARG = $(if $(filter-out noop, $(OS)), --os $(OS))
 build_%: ARCH = $(word 4, $(subst _, ,$@))
 build_%: ARCHARG = $(if $(ARCH), --arch $(ARCH))
 build_%: GOARG = $(if $(CROSSGOPATH), --go $(CROSSGOPATH))
@@ -66,6 +66,15 @@ extension: build_osquery-extension.ext
 grpc.ext: build_grpc.ext
 fake-launcher: fake_launcher
 
+##
+## GitHub Action Helpers
+##
+GITHUB_TARGETS=launcher osquery-extension.ext grpc.ext tables.ext package-builder
+GITHUB_ARCHS=amd64 arm64
+# linux cross compiles aren't working. Disable for now
+github-build-no-cross: $(foreach t, $(GITHUB_TARGETS), build_$(t))
+github-build: $(foreach t, $(GITHUB_TARGETS), $(foreach a, $(GITHUB_ARCHS), build_$(t)_noop_$(a)))
+github-lipo: $(foreach t, $(GITHUB_TARGETS), lipo_$(t))
 
 ##
 ## Cross Build targets
@@ -81,10 +90,10 @@ AMD64_OSES=darwin windows linux
 xp: $(foreach target, $(RELEASE_TARGETS), $(foreach os, $(MANUAL_CROSS_OSES), build_$(target)_$(os)))
 
 # Actual release targets. Because of the m1 cgo cross stuff, this requires explicit go paths
-rel-amd64: CROSSGOPATH = /opt/go1.16.2.darwin-amd64/bin/go
+rel-amd64: CROSSGOPATH = /opt/go1.16.10.darwin-amd64/bin/go
 rel-amd64: $(foreach target, $(RELEASE_TARGETS), $(foreach os, $(AMD64_OSES), build_$(target)_$(os)_amd64))
 
-rel-arm64: CROSSGOPATH = /opt/go1.16.2.darwin-arm64/bin/go
+rel-arm64: CROSSGOPATH = /opt/go1.16.10.darwin-arm64/bin/go
 rel-arm64: $(foreach target, $(RELEASE_TARGETS), $(foreach os, $(ARM64_OSES), build_$(target)_$(os)_arm64))
 
 rel-lipo: $(foreach target, $(RELEASE_TARGETS), lipo_$(target))

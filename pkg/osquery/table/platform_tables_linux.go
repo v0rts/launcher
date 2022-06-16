@@ -11,12 +11,11 @@ import (
 	"github.com/kolide/launcher/pkg/osquery/tables/gsettings"
 	"github.com/kolide/launcher/pkg/osquery/tables/secureboot"
 	"github.com/kolide/launcher/pkg/osquery/tables/xrdb"
-	osquery "github.com/kolide/osquery-go"
-	"github.com/kolide/osquery-go/plugin/table"
+	osquery "github.com/osquery/osquery-go"
 )
 
-func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, currentOsquerydBinaryPath string) []*table.Plugin {
-	return []*table.Plugin{
+func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, currentOsquerydBinaryPath string) []osquery.OsqueryPlugin {
+	return []osquery.OsqueryPlugin{
 		cryptsetup.TablePlugin(client, logger),
 		gsettings.Settings(client, logger),
 		gsettings.Metadata(client, logger),

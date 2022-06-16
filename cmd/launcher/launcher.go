@@ -18,10 +18,14 @@ import (
 	"github.com/kolide/kit/fs"
 	"github.com/kolide/kit/logutil"
 	"github.com/kolide/kit/version"
+	"github.com/kolide/launcher/cmd/launcher/internal"
+	"github.com/kolide/launcher/cmd/launcher/internal/updater"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 	"github.com/kolide/launcher/pkg/debug"
 	"github.com/kolide/launcher/pkg/launcher"
+	"github.com/kolide/launcher/pkg/log/checkpoint"
 	"github.com/kolide/launcher/pkg/osquery"
+	osqueryInstanceHistory "github.com/kolide/launcher/pkg/osquery/runtime/history"
 	"github.com/kolide/launcher/pkg/service"
 	"github.com/oklog/run"
 	"github.com/pkg/errors"
@@ -91,6 +95,14 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		return errors.Wrap(err, "write launcher pid to file")
 	}
 
+	// If we have successfully opened the DB, and written a pid,
+	// we expect we're live. Record the version for osquery to
+	// pickup
+	internal.RecordLauncherVersion(rootDirectory)
+
+	// Try to ensure useful info in the logs
+	checkpoint.Run(logger, db, *opts)
+
 	// create the certificate pool
 	var rootPool *x509.CertPool
 	if opts.RootPEM != "" {
@@ -139,9 +151,17 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 			runGroup.Add(queryTargeter.Execute, queryTargeter.Interrupt)
 		case "jsonrpc":
 			client = service.NewJSONRPCClient(opts.KolideServerURL, opts.InsecureTLS, opts.InsecureTransport, opts.CertPins, rootPool, logger)
+		case "osquery":
+			client = service.NewNoopClient(logger)
 		default:
 			return errors.New("invalid transport option selected")
 		}
+	}
+
+	// init osquery instance history
+	err = osqueryInstanceHistory.InitHistory(db)
+	if err != nil {
+		return errors.Wrap(err, "error initializing osquery instance history")
 	}
 
 	// create the osquery extension for launcher. This is where osquery itself is launched.
@@ -173,7 +193,7 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 
 	// If the autoupdater is enabled, enable it for both osquery and launcher
 	if opts.Autoupdate {
-		osqueryUpdaterconfig := &updaterConfig{
+		osqueryUpdaterconfig := &updater.UpdaterConfig{
 			Logger:             logger,
 			RootDirectory:      rootDirectory,
 			AutoupdateInterval: opts.AutoupdateInterval,
@@ -187,13 +207,13 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		}
 
 		// create an updater for osquery
-		osqueryUpdater, err := createUpdater(ctx, opts.OsquerydPath, runnerRestart, osqueryUpdaterconfig)
+		osqueryUpdater, err := updater.NewUpdater(ctx, opts.OsquerydPath, runnerRestart, osqueryUpdaterconfig)
 		if err != nil {
 			return errors.Wrap(err, "create osquery updater")
 		}
 		runGroup.Add(osqueryUpdater.Execute, osqueryUpdater.Interrupt)
 
-		launcherUpdaterconfig := &updaterConfig{
+		launcherUpdaterconfig := &updater.UpdaterConfig{
 			Logger:             logger,
 			RootDirectory:      rootDirectory,
 			AutoupdateInterval: opts.AutoupdateInterval,
@@ -211,10 +231,10 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		if err != nil {
 			logutil.Fatal(logger, "err", err)
 		}
-		launcherUpdater, err := createUpdater(
+		launcherUpdater, err := updater.NewUpdater(
 			ctx,
 			launcherPath,
-			updateFinalizer(logger, runnerShutdown),
+			updater.UpdateFinalizer(logger, runnerShutdown),
 			launcherUpdaterconfig,
 		)
 		if err != nil {

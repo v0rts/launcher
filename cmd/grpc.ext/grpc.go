@@ -15,10 +15,10 @@ import (
 	"github.com/kolide/kit/version"
 	grpcext "github.com/kolide/launcher/pkg/osquery"
 	"github.com/kolide/launcher/pkg/service"
-	osquery "github.com/kolide/osquery-go"
-	"github.com/kolide/osquery-go/plugin/config"
-	"github.com/kolide/osquery-go/plugin/distributed"
-	osquery_logger "github.com/kolide/osquery-go/plugin/logger"
+	osquery "github.com/osquery/osquery-go"
+	"github.com/osquery/osquery-go/plugin/config"
+	"github.com/osquery/osquery-go/plugin/distributed"
+	osquery_logger "github.com/osquery/osquery-go/plugin/logger"
 	"github.com/pkg/errors"
 	"go.etcd.io/bbolt"
 )
@@ -26,7 +26,7 @@ import (
 func main() {
 	var (
 		flSocketPath = flag.String("socket", "", "")
-		flTimeout    = flag.Int("timeout", 0, "")
+		flTimeout    = flag.Int("timeout", 2, "")
 		flVerbose    = flag.Bool("verbose", false, "")
 		flVersion    = flag.Bool("version", false, "Print Launcher version and exit")
 

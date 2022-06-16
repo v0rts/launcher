@@ -7,6 +7,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/knightsc/system_policy/osquery/table/kextpolicy"
 	"github.com/knightsc/system_policy/osquery/table/legacyexec"
+	"github.com/kolide/launcher/pkg/osquery/tables/airport"
 	appicons "github.com/kolide/launcher/pkg/osquery/tables/app-icons"
 	"github.com/kolide/launcher/pkg/osquery/tables/dataflattentable"
 	"github.com/kolide/launcher/pkg/osquery/tables/filevault"
@@ -18,9 +19,9 @@ import (
 	"github.com/kolide/launcher/pkg/osquery/tables/profiles"
 	"github.com/kolide/launcher/pkg/osquery/tables/pwpolicy"
 	"github.com/kolide/launcher/pkg/osquery/tables/systemprofiler"
-	osquery "github.com/kolide/osquery-go"
-	"github.com/kolide/osquery-go/plugin/table"
 	_ "github.com/mattn/go-sqlite3"
+	osquery "github.com/osquery/osquery-go"
+	"github.com/osquery/osquery-go/plugin/table"
 )
 
 const (
@@ -29,7 +30,7 @@ const (
 	screenlockQuery    = "select enabled, grace_period from screenlock"
 )
 
-func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, currentOsquerydBinaryPath string) []*table.Plugin {
+func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, currentOsquerydBinaryPath string) []osquery.OsqueryPlugin {
 	munki := munki.New()
 
 	// This table uses undocumented APIs, There is some discussion at the
@@ -67,7 +68,7 @@ func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, c
 			table.TextColumn("path"),
 		})
 
-	return []*table.Plugin{
+	return []osquery.OsqueryPlugin{
 		keychainAclsTable,
 		keychainItemsTable,
 		Airdrop(client),
@@ -86,6 +87,7 @@ func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, c
 		UserAvatar(logger),
 		ioreg.TablePlugin(client, logger),
 		profiles.TablePlugin(client, logger),
+		airport.TablePlugin(client, logger),
 		kextpolicy.TablePlugin(),
 		filevault.TablePlugin(client, logger),
 		mdmclient.TablePlugin(client, logger),

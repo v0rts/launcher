@@ -5,10 +5,13 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"os"
+	"path/filepath"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/kit/actor"
+	"github.com/kolide/launcher/cmd/launcher/internal"
 	"github.com/kolide/launcher/pkg/augeas"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 	"github.com/kolide/launcher/pkg/launcher"
@@ -17,9 +20,9 @@ import (
 	"github.com/kolide/launcher/pkg/osquery/runtime"
 	ktable "github.com/kolide/launcher/pkg/osquery/table"
 	"github.com/kolide/launcher/pkg/service"
-	"github.com/kolide/osquery-go/plugin/config"
-	"github.com/kolide/osquery-go/plugin/distributed"
-	osquerylogger "github.com/kolide/osquery-go/plugin/logger"
+	"github.com/osquery/osquery-go/plugin/config"
+	"github.com/osquery/osquery-go/plugin/distributed"
+	osquerylogger "github.com/osquery/osquery-go/plugin/logger"
 	"github.com/pkg/errors"
 	"go.etcd.io/bbolt"
 )
@@ -83,39 +86,19 @@ func createExtensionRuntime(ctx context.Context, db *bbolt.DB, launcherClient se
 		return nil, nil, nil, errors.Wrap(err, "starting grpc extension")
 	}
 
-	// create the logging adapters for osquery
-	osqueryStderrLogger := kolidelog.NewOsqueryLogAdapter(
-		logger,
-		kolidelog.WithLevelFunc(level.Info),
-		kolidelog.WithKeyValue("component", "osquery"),
-		kolidelog.WithKeyValue("level", "stderr"),
-	)
-	osqueryStdoutLogger := kolidelog.NewOsqueryLogAdapter(
-		logger,
-		kolidelog.WithLevelFunc(level.Debug),
-		kolidelog.WithKeyValue("component", "osquery"),
-		kolidelog.WithKeyValue("level", "stdout"),
-	)
+	var runnerOptions []runtime.OsqueryInstanceOption
 
-	runner := runtime.LaunchUnstartedInstance(
-		runtime.WithOsquerydBinary(opts.OsquerydPath),
-		runtime.WithRootDirectory(opts.RootDirectory),
-		runtime.WithConfigPluginFlag("kolide_grpc"),
-		runtime.WithLoggerPluginFlag("kolide_grpc"),
-		runtime.WithDistributedPluginFlag("kolide_grpc"),
-		runtime.WithOsqueryExtensionPlugins(
-			config.NewPlugin("kolide_grpc", ext.GenerateConfigs),
-			distributed.NewPlugin("kolide_grpc", ext.GetQueries, ext.WriteResults),
-			osquerylogger.NewPlugin("kolide_grpc", ext.LogString),
-		),
-		runtime.WithOsqueryExtensionPlugins(ktable.LauncherTables(db, opts)...),
-		runtime.WithStdout(osqueryStdoutLogger),
-		runtime.WithStderr(osqueryStderrLogger),
-		runtime.WithLogger(logger),
-		runtime.WithOsqueryVerbose(opts.OsqueryVerbose),
-		runtime.WithOsqueryFlags(opts.OsqueryFlags),
-		runtime.WithAugeasLensFunction(augeas.InstallLenses),
-	)
+	if opts.Transport == "osquery" {
+		var err error
+		runnerOptions, err = osqueryRunnerOptions(logger, db, opts)
+		if err != nil {
+			return nil, nil, nil, errors.Wrap(err, "creating osquery runner options")
+		}
+	} else {
+		runnerOptions = grpcRunnerOptions(logger, db, opts, ext)
+	}
+
+	runner := runtime.LaunchUnstartedInstance(runnerOptions...)
 
 	restartFunc := func() error {
 		level.Debug(logger).Log(
@@ -135,17 +118,40 @@ func createExtensionRuntime(ctx context.Context, db *bbolt.DB, launcherClient se
 					return errors.Wrap(err, "launching osquery instance")
 				}
 
+				// If we're using osquery transport, we don't need the extension
+				if opts.Transport == "osquery" {
+					level.Debug(logger).Log("msg", "Using osquery transport, skipping extension startup")
+
+					// TODO: remove when underlying libs are refactored
+					// everything exits right now, so block this actor on the context finishing
+					<-ctx.Done()
+					return nil
+				}
+
 				// The runner allows querying the osqueryd instance from the extension.
 				// Used by the Enroll method below to get initial enrollment details.
 				ext.SetQuerier(runner)
 
-				// enroll this launcher with the server
-				_, invalid, err := ext.Enroll(ctx)
-				if err != nil {
-					return errors.Wrap(err, "enrolling host")
-				}
-				if invalid {
-					return errors.Wrap(err, "invalid enroll secret")
+				// It's not clear to me _why_ the extension
+				// ever called Enroll here. From what
+				// I can tell, this would cause the
+				// launcher extension to do a bunch of
+				// initial setup (create node key,
+				// etc). But, this is also done by
+				// osquery. And having them both
+				// attempt it is a bit racey.  I'm not
+				// so confident to outright remove it,
+				// so it's gated behind this debugging
+				// environment.
+				if os.Getenv("LAUNCHER_DEBUG_ENROLL_FIRST") == "true" {
+					// enroll this launcher with the server
+					_, invalid, err := ext.Enroll(ctx)
+					if err != nil {
+						return errors.Wrap(err, "enrolling host")
+					}
+					if invalid {
+						return errors.Wrap(err, "invalid enroll secret")
+					}
 				}
 
 				// start the extension
@@ -173,4 +179,87 @@ func createExtensionRuntime(ctx context.Context, db *bbolt.DB, launcherClient se
 		restartFunc,
 		runner.Shutdown,
 		nil
+}
+
+// commonRunnerOptions returns osquery runtime options common to all transports
+func commonRunnerOptions(logger log.Logger, db *bbolt.DB, opts *launcher.Options) []runtime.OsqueryInstanceOption {
+	// create the logging adapters for osquery
+	osqueryStderrLogger := kolidelog.NewOsqueryLogAdapter(
+		logger,
+		kolidelog.WithLevelFunc(level.Info),
+		kolidelog.WithKeyValue("component", "osquery"),
+		kolidelog.WithKeyValue("osqlevel", "stderr"),
+	)
+	osqueryStdoutLogger := kolidelog.NewOsqueryLogAdapter(
+		logger,
+		kolidelog.WithLevelFunc(level.Debug),
+		kolidelog.WithKeyValue("component", "osquery"),
+		kolidelog.WithKeyValue("osqlevel", "stdout"),
+	)
+
+	return []runtime.OsqueryInstanceOption{
+		runtime.WithOsquerydBinary(opts.OsquerydPath),
+		runtime.WithRootDirectory(opts.RootDirectory),
+		runtime.WithOsqueryExtensionPlugins(ktable.LauncherTables(db, opts)...),
+		runtime.WithStdout(osqueryStdoutLogger),
+		runtime.WithStderr(osqueryStderrLogger),
+		runtime.WithLogger(logger),
+		runtime.WithOsqueryVerbose(opts.OsqueryVerbose),
+		runtime.WithOsqueryFlags(opts.OsqueryFlags),
+		runtime.WithAugeasLensFunction(augeas.InstallLenses),
+	}
+}
+
+// osqueryRunnerOptions returns the osquery runtime options when using native osquery transport
+func osqueryRunnerOptions(logger log.Logger, db *bbolt.DB, opts *launcher.Options) ([]runtime.OsqueryInstanceOption, error) {
+	// As osquery requires TLS server certs, we'll  use our embedded defaults if not specified
+	caCertFile := opts.RootPEM
+	if caCertFile == "" {
+		var err error
+		caCertFile, err = internal.InstallCaCerts(opts.RootDirectory)
+		if err != nil {
+			return nil, errors.Wrap(err, "writing CA certs")
+		}
+	}
+
+	runtimeOptions := append(
+		commonRunnerOptions(logger, db, opts),
+		runtime.WithConfigPluginFlag("tls"),
+		runtime.WithDistributedPluginFlag("tls"),
+		runtime.WithLoggerPluginFlag("tls"),
+		runtime.WithTlsConfigEndpoint(opts.OsqueryTlsConfigEndpoint),
+		runtime.WithTlsDistributedReadEndpoint(opts.OsqueryTlsDistributedReadEndpoint),
+		runtime.WithTlsDistributedWriteEndpoint(opts.OsqueryTlsDistributedWriteEndpoint),
+		runtime.WithTlsEnrollEndpoint(opts.OsqueryTlsEnrollEndpoint),
+		runtime.WithTlsHostname(opts.KolideServerURL),
+		runtime.WithTlsLoggerEndpoint(opts.OsqueryTlsLoggerEndpoint),
+		runtime.WithTlsServerCerts(caCertFile),
+	)
+
+	// Enroll secrets... Either we pass a file, or we write a
+	// secret, and pass _that_ file
+	if opts.EnrollSecretPath != "" {
+		runtimeOptions = append(runtimeOptions, runtime.WithEnrollSecretPath(opts.EnrollSecretPath))
+	} else if opts.EnrollSecret != "" {
+		filename := filepath.Join(opts.RootDirectory, "secret")
+		os.WriteFile(filename, []byte(opts.EnrollSecret), 0400)
+		runtimeOptions = append(runtimeOptions, runtime.WithEnrollSecretPath(filename))
+	}
+
+	return runtimeOptions, nil
+}
+
+// grpcRunnerOptions returns the osquery runtime options when using launcher transports. (Eg: grpc or jsonrpc)
+func grpcRunnerOptions(logger log.Logger, db *bbolt.DB, opts *launcher.Options, ext *osquery.Extension) []runtime.OsqueryInstanceOption {
+	return append(
+		commonRunnerOptions(logger, db, opts),
+		runtime.WithConfigPluginFlag("kolide_grpc"),
+		runtime.WithLoggerPluginFlag("kolide_grpc"),
+		runtime.WithDistributedPluginFlag("kolide_grpc"),
+		runtime.WithOsqueryExtensionPlugins(
+			config.NewPlugin("kolide_grpc", ext.GenerateConfigs),
+			distributed.NewPlugin("kolide_grpc", ext.GetQueries, ext.WriteResults),
+			osquerylogger.NewPlugin("kolide_grpc", ext.LogString),
+		),
+	)
 }

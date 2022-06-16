@@ -21,12 +21,14 @@ import (
 
 	"github.com/kolide/kit/fs"
 	"github.com/kolide/kit/testutil"
+	"github.com/kolide/launcher/pkg/osquery/runtime/history"
 	"github.com/kolide/launcher/pkg/packaging"
-	osquery "github.com/kolide/osquery-go"
 	ps "github.com/mitchellh/go-ps"
+	osquery "github.com/osquery/osquery-go"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/bbolt"
 )
 
 var testOsqueryBinaryDirectory string
@@ -39,6 +41,19 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	defer rmBinDirectory()
+
+	db, err := bbolt.Open(filepath.Join(binDirectory, "osquery_instance_history_test.db"), 0600, &bbolt.Options{
+		Timeout: 1 * time.Second,
+	})
+	if err != nil {
+		fmt.Println("Falied to create bolt db")
+		os.Exit(1)
+	}
+	if err := history.InitHistory(db); err != nil {
+		fmt.Println("Failed to init history")
+		os.Exit(1)
+	}
+
 	testOsqueryBinaryDirectory = filepath.Join(binDirectory, "osqueryd")
 
 	if err := downloadOsqueryInBinDir(binDirectory); err != nil {
@@ -129,8 +144,8 @@ func TestCreateOsqueryCommandWithFlags(t *testing.T) {
 	assert.Equal(
 		t,
 		[]string{"--verbose=false", "--windows_event_channels=foo,bar"},
-		// 6 is for the 6 flags that cannot be overridden with this option.
-		cmd.Args[len(cmd.Args)-2-6:len(cmd.Args)-6],
+		// 7 is for the 7 flags that cannot be overridden with this option.
+		cmd.Args[len(cmd.Args)-2-7:len(cmd.Args)-7],
 	)
 }
 
@@ -237,6 +252,9 @@ func TestSimplePath(t *testing.T) {
 
 	waitHealthy(t, runner)
 
+	require.NotEmpty(t, runner.instance.stats.StartTime, "start time should be added to instance stats on start up")
+	require.NotEmpty(t, runner.instance.stats.ConnectTime, "connect time should be added to instance stats on start up")
+
 	require.NoError(t, runner.Shutdown())
 }
 
@@ -245,11 +263,27 @@ func TestRestart(t *testing.T) {
 	runner, _, teardown := setupOsqueryInstanceForTests(t)
 	defer teardown()
 
-	require.NoError(t, runner.Restart())
-	waitHealthy(t, runner)
+	previousStats := runner.instance.stats
 
 	require.NoError(t, runner.Restart())
 	waitHealthy(t, runner)
+
+	require.NotEmpty(t, runner.instance.stats.StartTime, "start time should be set on latest instance stats after restart")
+	require.NotEmpty(t, runner.instance.stats.ConnectTime, "connect time should be set on latest instance stats after restart")
+
+	require.NotEmpty(t, previousStats.ExitTime, "exit time should be set on last instance stats when restarted")
+	require.NotEmpty(t, previousStats.Error, "stats instance should have an error on restart")
+
+	previousStats = runner.instance.stats
+
+	require.NoError(t, runner.Restart())
+	waitHealthy(t, runner)
+
+	require.NotEmpty(t, runner.instance.stats.StartTime, "start time should be added to latest instance stats after restart")
+	require.NotEmpty(t, runner.instance.stats.ConnectTime, "connect time should be added to latest instance stats after restart")
+
+	require.NotEmpty(t, previousStats.ExitTime, "exit time should be set on instance stats when restarted")
+	require.NotEmpty(t, previousStats.Error, "stats instance should have an error on restart")
 }
 
 func TestOsqueryDies(t *testing.T) {
@@ -266,6 +300,8 @@ func TestOsqueryDies(t *testing.T) {
 
 	waitHealthy(t, runner)
 
+	previousStats := runner.instance.stats
+
 	// Simulate the osquery process unexpectedly dying
 	runner.instanceLock.Lock()
 	require.NoError(t, killProcessGroup(runner.instance.cmd))
@@ -273,6 +309,8 @@ func TestOsqueryDies(t *testing.T) {
 	runner.instanceLock.Unlock()
 
 	waitHealthy(t, runner)
+	require.NotEmpty(t, previousStats.Error, "error should be added to stats when unexpected shutdown")
+	require.NotEmpty(t, previousStats.ExitTime, "exit time should be added to instance when unexpected shutdown")
 
 	require.NoError(t, runner.Shutdown())
 }
@@ -372,7 +410,7 @@ func TestExtensionSocketPath(t *testing.T) {
 	require.NoError(t, err)
 	defer client.Close()
 
-	resp, err := client.Query("select * from kolide_launcher_info")
+	resp, err := client.Query("select * from launcher_gc_info")
 	require.NoError(t, err)
 	assert.Equal(t, int32(0), resp.Status.Code)
 	assert.Equal(t, "OK", resp.Status.Message)

@@ -10,6 +10,8 @@ import (
 type Options struct {
 	// KolideServerURL is the URL of the management server to connect to.
 	KolideServerURL string
+	// KolideHosted true if using Kolide SaaS settings
+	KolideHosted bool
 	// EnrollSecret contains the raw enroll secret.
 	EnrollSecret string
 	// EnrollSecretPath contains the path to a file containing the enroll
@@ -45,6 +47,13 @@ type Options struct {
 	// ControlServerURL URL for control server.
 	ControlServerURL string
 
+	// Osquery TLS options
+	OsqueryTlsConfigEndpoint           string
+	OsqueryTlsEnrollEndpoint           string
+	OsqueryTlsLoggerEndpoint           string
+	OsqueryTlsDistributedReadEndpoint  string
+	OsqueryTlsDistributedWriteEndpoint string
+
 	// Autoupdate enables the autoupdate functionality.
 	Autoupdate bool
 	// NotaryServerURL is the URL for the Notary server.
@@ -76,4 +85,6 @@ type Options struct {
 	InsecureTLS bool
 	// InsecureTransport disables TLS in the transport layer.
 	InsecureTransport bool
+	// CompactDbMaxTx sets the max transaction size for bolt db compaction operations
+	CompactDbMaxTx int64
 }

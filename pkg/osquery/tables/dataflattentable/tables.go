@@ -9,8 +9,8 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/launcher/pkg/dataflatten"
 	"github.com/kolide/launcher/pkg/osquery/tables/tablehelpers"
-	"github.com/kolide/osquery-go"
-	"github.com/kolide/osquery-go/plugin/table"
+	"github.com/osquery/osquery-go"
+	"github.com/osquery/osquery-go/plugin/table"
 	"github.com/pkg/errors"
 )
 
@@ -40,8 +40,8 @@ type Table struct {
 }
 
 // AllTablePlugins is a helper to return all the expected flattening tables.
-func AllTablePlugins(client *osquery.ExtensionManagerClient, logger log.Logger) []*table.Plugin {
-	return []*table.Plugin{
+func AllTablePlugins(client *osquery.ExtensionManagerClient, logger log.Logger) []osquery.OsqueryPlugin {
+	return []osquery.OsqueryPlugin{
 		TablePlugin(client, logger, JsonType),
 		TablePlugin(client, logger, XmlType),
 		TablePlugin(client, logger, IniType),
@@ -49,7 +49,7 @@ func AllTablePlugins(client *osquery.ExtensionManagerClient, logger log.Logger) 
 	}
 }
 
-func TablePlugin(client *osquery.ExtensionManagerClient, logger log.Logger, dataSourceType DataSourceType) *table.Plugin {
+func TablePlugin(client *osquery.ExtensionManagerClient, logger log.Logger, dataSourceType DataSourceType) osquery.OsqueryPlugin {
 
 	columns := Columns(table.TextColumn("path"))
 
@@ -99,7 +99,12 @@ func (t *Table) generate(ctx context.Context, queryContext table.QueryContext) (
 			for _, dataQuery := range tablehelpers.GetConstraints(queryContext, "query", tablehelpers.WithDefaults("*")) {
 				subresults, err := t.generatePath(filePath, dataQuery)
 				if err != nil {
-					return results, errors.Wrapf(err, "generating for path %s with query", filePath)
+					level.Info(t.logger).Log(
+						"msg", "failed to get data for path",
+						"path", filePath,
+						"err", err,
+					)
+					continue
 				}
 
 				results = append(results, subresults...)
