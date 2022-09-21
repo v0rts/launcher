@@ -154,7 +154,7 @@ type mockClient struct{}
 
 func (mockClient) Query(sql string) ([]map[string]string, error) {
 	return []map[string]string{
-		map[string]string{
+		{
 			"os_version":       "",
 			"launcher_version": "",
 			"os_build":         "",
@@ -550,8 +550,8 @@ func TestExtensionWriteBufferedLogs(t *testing.T) {
 	assert.Nil(t, gotResultLogs)
 }
 
-func TestExtensionWriteBufferedLogsEnrollmentInvalid(t *testing.T) {
-	t.Parallel()
+func TestExtensionWriteBufferedLogsEnrollmentInvalid(t *testing.T) { //nolint:paralleltest
+	// t.Parallel() commented out due to timeouts in github actions runner
 
 	// Test for https://github.com/kolide/launcher/issues/219 in which a
 	// call to writeBufferedLogsForType with an invalid node key causes a
@@ -676,6 +676,10 @@ func TestExtensionWriteBufferedLogsDropsBigLog(t *testing.T) {
 	})
 	require.Nil(t, err)
 
+	startLogCount, err := e.numberOfBufferedLogs(logger.LogTypeString)
+	require.NoError(t, err)
+	require.Equal(t, 0, startLogCount, "start with no buffered logs")
+
 	expectedResultLogs := []string{"res1", "res2", "res3", "res4"}
 	e.LogString(context.Background(), logger.LogTypeString, "this_result_is_tooooooo_big! oh noes")
 	e.LogString(context.Background(), logger.LogTypeString, "res1")
@@ -685,6 +689,10 @@ func TestExtensionWriteBufferedLogsDropsBigLog(t *testing.T) {
 	e.LogString(context.Background(), logger.LogTypeString, "res3")
 	e.LogString(context.Background(), logger.LogTypeString, "res4")
 	e.LogString(context.Background(), logger.LogTypeString, "this_result_is_tooooooo_big! darn")
+
+	queuedLogCount, err := e.numberOfBufferedLogs(logger.LogTypeString)
+	require.NoError(t, err)
+	require.Equal(t, 8, queuedLogCount, "correct number of enqueued logs")
 
 	// Should write first 3 logs
 	e.writeBufferedLogsForType(logger.LogTypeString)
@@ -706,10 +714,14 @@ func TestExtensionWriteBufferedLogsDropsBigLog(t *testing.T) {
 	assert.False(t, m.PublishLogsFuncInvoked)
 	assert.Nil(t, gotResultLogs)
 	assert.Nil(t, gotStatusLogs)
+
+	finalLogCount, err := e.numberOfBufferedLogs(logger.LogTypeString)
+	require.NoError(t, err)
+	require.Equal(t, 0, finalLogCount, "no more queued logs")
 }
 
-func TestExtensionWriteLogsLoop(t *testing.T) {
-	t.Parallel()
+func TestExtensionWriteLogsLoop(t *testing.T) { //nolint:paralleltest
+	// t.Parallel() commented out due to timeouts in github actions runner
 
 	var gotStatusLogs, gotResultLogs []string
 	var funcInvokedStatus, funcInvokedResult bool
@@ -1001,4 +1013,30 @@ func TestExtensionWriteResults(t *testing.T) {
 	assert.True(t, m.PublishResultsFuncInvoked)
 	assert.Nil(t, err)
 	assert.Equal(t, expectedResults, gotResults)
+}
+
+func TestLauncherKeys(t *testing.T) {
+	t.Parallel()
+
+	m := &mock.KolideService{}
+
+	db, cleanup := makeTempDB(t)
+	defer cleanup()
+	_, err := NewExtension(m, db, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	require.NoError(t, err)
+
+	key, err := PrivateKeyFromDB(db)
+	require.NoError(t, err)
+
+	pubkeyPem, fingerprintStored, err := PublicKeyFromDB(db)
+	require.NoError(t, err)
+
+	fingerprint, err := rsaFingerprint(key)
+	require.NoError(t, err)
+	require.Equal(t, fingerprint, fingerprintStored)
+
+	pubkey, err := KeyFromPem([]byte(pubkeyPem))
+	require.NoError(t, err)
+
+	require.Equal(t, &key.PublicKey, pubkey)
 }

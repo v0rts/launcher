@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -198,6 +199,14 @@ func WithAugeasLensFunction(f func(dir string) error) OsqueryInstanceOption {
 	}
 }
 
+// WithAutoloadedExtensions defines a list of extensions to load
+// via the osquery autoloading.
+func WithAutoloadedExtensions(extensions ...string) OsqueryInstanceOption {
+	return func(i *OsqueryInstance) {
+		i.opts.autoloadedExtensions = append(i.opts.autoloadedExtensions, extensions...)
+	}
+}
+
 // OsqueryInstance is the type which represents a currently running instance
 // of osqueryd.
 type OsqueryInstance struct {
@@ -263,6 +272,11 @@ func (o *OsqueryInstance) Healthy() error {
 func (o *OsqueryInstance) Query(query string) ([]map[string]string, error) {
 	o.clientLock.Lock()
 	defer o.clientLock.Unlock()
+
+	if o.extensionManagerClient == nil {
+		return nil, errors.New("client not ready")
+	}
+
 	resp, err := o.extensionManagerClient.Query(query)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not query the extension manager client")
@@ -282,6 +296,7 @@ type osqueryOptions struct {
 	configPluginFlag      string
 	distributedPluginFlag string
 	extensionPlugins      []osquery.OsqueryPlugin
+	autoloadedExtensions  []string
 	extensionSocketPath   string
 	enrollSecretPath      string
 	loggerPluginFlag      string
@@ -298,6 +313,30 @@ type osqueryOptions struct {
 	tlsLoggerEndpoint     string
 	tlsServerCerts        string
 	verbose               bool
+}
+
+// requiredExtensions returns a unique list of external
+// extensions. These are extensions we expect osquery to pause start
+// for.
+func (o osqueryOptions) requiredExtensions() []string {
+	extensionsMap := make(map[string]bool)
+	requiredExtensions := make([]string, 0)
+
+	for _, extension := range append([]string{o.loggerPluginFlag, o.configPluginFlag, o.distributedPluginFlag}, o.autoloadedExtensions...) {
+		// skip the osquery build-ins, since requiring them will cause osquery to needlessly wait.
+		if extension == "tls" {
+			continue
+		}
+
+		if _, ok := extensionsMap[extension]; ok {
+			continue
+		}
+
+		extensionsMap[extension] = true
+		requiredExtensions = append(requiredExtensions, extension)
+	}
+
+	return requiredExtensions
 }
 
 func newInstance() *OsqueryInstance {
@@ -318,8 +357,8 @@ type osqueryFilePaths struct {
 	augeasPath            string
 	databasePath          string
 	extensionAutoloadPath string
-	extensionPath         string
 	extensionSocketPath   string
+	extensionPaths        []string
 	pidfilePath           string
 }
 
@@ -328,41 +367,67 @@ type osqueryFilePaths struct {
 // In return, a structure of paths is returned that can be used to launch an
 // osqueryd instance. An error may be returned if the supplied parameters are
 // unacceptable.
-func calculateOsqueryPaths(rootDir, extensionSocketPath string) (*osqueryFilePaths, error) {
+func calculateOsqueryPaths(opts osqueryOptions) (*osqueryFilePaths, error) {
+
+	// Determine the path to the extension socket
+	extensionSocketPath := opts.extensionSocketPath
+	if extensionSocketPath == "" {
+		extensionSocketPath = SocketPath(opts.rootDirectory)
+	}
+
+	extensionAutoloadPath := filepath.Join(opts.rootDirectory, "osquery.autoload")
+
+	osqueryFilePaths := &osqueryFilePaths{
+		pidfilePath:           filepath.Join(opts.rootDirectory, "osquery.pid"),
+		databasePath:          filepath.Join(opts.rootDirectory, "osquery.db"),
+		augeasPath:            filepath.Join(opts.rootDirectory, "augeas-lenses"),
+		extensionSocketPath:   extensionSocketPath,
+		extensionAutoloadPath: extensionAutoloadPath,
+		extensionPaths:        make([]string, len(opts.autoloadedExtensions)),
+	}
+
+	osqueryAutoloadFile, err := os.Create(extensionAutoloadPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "creating autoload file")
+	}
+	defer osqueryAutoloadFile.Close()
+
+	if len(opts.autoloadedExtensions) == 0 {
+		return osqueryFilePaths, nil
+	}
+
 	// Determine the path to the extension
 	exPath, err := os.Executable()
 	if err != nil {
 		return nil, errors.Wrap(err, "finding path of launcher executable")
 	}
 
-	extensionPath := filepath.Join(autoupdate.FindBaseDir(exPath), extensionName)
-	if _, err := os.Stat(extensionPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil, errors.Wrapf(err, "extension path does not exist: %s", extensionPath)
-		} else {
-			return nil, errors.Wrapf(err, "could not stat extension path")
+	for index, extension := range opts.autoloadedExtensions {
+		// first see if we just got a file name and check to see if it exists in the executable directory
+		extensionPath := filepath.Join(autoupdate.FindBaseDir(exPath), extension)
+
+		if _, err := os.Stat(extensionPath); err != nil {
+			// if we got an error, try the raw flag
+			extensionPath = extension
+
+			if _, err := os.Stat(extensionPath); err != nil {
+				if os.IsNotExist(err) {
+					return nil, errors.Wrapf(err, "extension path does not exist: %s", extension)
+				} else {
+					return nil, errors.Wrapf(err, "could not stat extension path")
+				}
+			}
+		}
+
+		osqueryFilePaths.extensionPaths[index] = extensionPath
+
+		_, err := osqueryAutoloadFile.WriteString(fmt.Sprintf("%s\n", extensionPath))
+		if err != nil {
+			return nil, errors.Wrapf(err, "writing to autoload file")
 		}
 	}
 
-	// Determine the path to the extension socket
-	if extensionSocketPath == "" {
-		extensionSocketPath = socketPath(rootDir)
-	}
-
-	// Write the autoload file
-	extensionAutoloadPath := filepath.Join(rootDir, "osquery.autoload")
-	if err := ioutil.WriteFile(extensionAutoloadPath, []byte(extensionPath), 0644); err != nil {
-		return nil, errors.Wrap(err, "could not write osquery extension autoload file")
-	}
-
-	return &osqueryFilePaths{
-		pidfilePath:           filepath.Join(rootDir, "osquery.pid"),
-		databasePath:          filepath.Join(rootDir, "osquery.db"),
-		augeasPath:            filepath.Join(rootDir, "augeas-lenses"),
-		extensionPath:         extensionPath,
-		extensionAutoloadPath: extensionAutoloadPath,
-		extensionSocketPath:   extensionSocketPath,
-	}, nil
+	return osqueryFilePaths, nil
 }
 
 // createOsquerydCommand uses osqueryOptions to return an *exec.Cmd
@@ -457,6 +522,7 @@ func (opts *osqueryOptions) createOsquerydCommand(osquerydBinary string, paths *
 		"--disable_extensions=false",
 		"--extensions_timeout=20",
 		fmt.Sprintf("--config_plugin=%s", opts.configPluginFlag),
+		fmt.Sprintf("--extensions_require=%s", strings.Join(opts.requiredExtensions(), ",")),
 	)
 
 	// On darwin, run osquery using a magic macOS variable to ensure we

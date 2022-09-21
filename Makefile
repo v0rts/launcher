@@ -2,7 +2,7 @@ all: build
 
 .PHONY: build
 
-ifndef ($(GOPATH))
+ifndef $GOPATH
 	GOPATH = $(HOME)/go
 endif
 
@@ -19,7 +19,7 @@ endif
 
 
 all: build
-build: build_launcher build_osquery-extension.ext
+build: build_launcher
 
 .pre-build: ${BUILD_DIR}
 
@@ -62,14 +62,13 @@ lipo_%: build/darwin.amd64/% build/darwin.arm64/%
 # pointers, mostly for legacy reasons
 launcher: build_launcher
 tables.ext: build_tables.ext
-extension: build_osquery-extension.ext
 grpc.ext: build_grpc.ext
 fake-launcher: fake_launcher
 
 ##
 ## GitHub Action Helpers
 ##
-GITHUB_TARGETS=launcher osquery-extension.ext grpc.ext tables.ext package-builder
+GITHUB_TARGETS=launcher grpc.ext tables.ext package-builder
 GITHUB_ARCHS=amd64 arm64
 # linux cross compiles aren't working. Disable for now
 github-build-no-cross: $(foreach t, $(GITHUB_TARGETS), build_$(t))
@@ -80,7 +79,7 @@ github-lipo: $(foreach t, $(GITHUB_TARGETS), lipo_$(t))
 ## Cross Build targets
 ##
 
-RELEASE_TARGETS=launcher osquery-extension.ext package-builder
+RELEASE_TARGETS=launcher package-builder
 MANUAL_CROSS_OSES=darwin windows linux
 ARM64_OSES=darwin
 AMD64_OSES=darwin windows linux
@@ -149,6 +148,10 @@ sudo-osqueryi-tables: build_tables.ext
 launchas-osqueryi-tables: build_tables.ext
 	sudo launchctl asuser 0 osqueryd -S --allow-unsafe --verbose --extension ./build/tables.ext
 
+install-local-fake-update: D = $(shell date +%s)
+install-local-fake-update: build_launcher
+	sudo mkdir /usr/local/kolide-k2/bin/launcher-updates/$(D)
+	sudo cp build/launcher /usr/local/kolide-k2/bin/launcher-updates/$(D)/
 
 # `-o runtime` should be enough, however there was a catalina bug that
 # required we add `library`. This was fixed in 10.15.4. (from
@@ -179,7 +182,7 @@ notarize-check-%:
 
 # Using the `osslsigncode` we can sign windows binaries from
 # non-windows platforms.
-codesign-windows: codesign-windows-launcher.exe  codesign-windows-osquery-extension.exe
+codesign-windows: codesign-windows-launcher.exe
 codesign-windows-%: P12 = ~/Documents/kolide-codesigning-2021-04.p12
 codesign-windows-%:
 	@if [ -z "${AUTHENTICODE_PASSPHRASE}" ]; then echo "Missing AUTHENTICODE_PASSPHRASE"; exit 1; fi

@@ -42,16 +42,16 @@ type Runner struct {
 // returned instance should be shut down via the Shutdown() method.
 // For example, a more customized caller might do something like the following:
 //
-//   instance, err := LaunchInstance(
-//     WithOsquerydBinary("/usr/local/bin/osqueryd"),
-//     WithRootDirectory("/var/foobar"),
-//     WithConfigPluginFlag("custom"),
-// 		 WithOsqueryExtensionPlugins(
-//		 	 config.NewPlugin("custom", custom.GenerateConfigs),
-//		   logger.NewPlugin("custom", custom.LogString),
-//		 	 tables.NewPlugin("foobar", custom.FoobarColumns, custom.FoobarGenerate),
-//     ),
-//   )
+//	  instance, err := LaunchInstance(
+//	    WithOsquerydBinary("/usr/local/bin/osqueryd"),
+//	    WithRootDirectory("/var/foobar"),
+//	    WithConfigPluginFlag("custom"),
+//			 WithOsqueryExtensionPlugins(
+//			 	 config.NewPlugin("custom", custom.GenerateConfigs),
+//			   logger.NewPlugin("custom", custom.LogString),
+//			 	 tables.NewPlugin("foobar", custom.FoobarColumns, custom.FoobarGenerate),
+//	    ),
+//	  )
 func LaunchInstance(opts ...OsqueryInstanceOption) (*Runner, error) {
 	runner := newRunner(opts...)
 	if err := runner.Start(); err != nil {
@@ -194,18 +194,21 @@ func (r *Runner) launchOsqueryInstance() error {
 
 	// Based on the root directory, calculate the file names of all of the
 	// required osquery artifact files.
-	paths, err := calculateOsqueryPaths(o.opts.rootDirectory, o.opts.extensionSocketPath)
+	paths, err := calculateOsqueryPaths(o.opts)
 	if err != nil {
 		return errors.Wrap(err, "could not calculate osquery file paths")
 	}
 
-	// The extensions file should be owned by the process's UID or by root.
-	// Osquery will refuse to load the extension otherwise.
-	if err := ensureProperPermissions(o, paths.extensionPath); err != nil {
-		level.Info(o.logger).Log(
-			"msg", "unable to ensure proper permissions on extension path",
-			"err", err,
-		)
+	for _, path := range paths.extensionPaths {
+		// The extensions files should be owned by the process's UID or by root.
+		// Osquery will refuse to load the extension otherwise.
+		if err := ensureProperPermissions(o, path); err != nil {
+			level.Info(o.logger).Log(
+				"msg", "unable to ensure proper permissions on extension path",
+				"path", path,
+				"err", err,
+			)
+		}
 	}
 
 	// Populate augeas lenses, if requested
@@ -363,9 +366,9 @@ func (r *Runner) launchOsqueryInstance() error {
 	// ordering issues.
 
 	// Start an extension manager for the extensions that osquery
-	// needs for config/log/etc
+	// needs for config/log/etc. It's called `kolide_grpc` for mostly historic reasons
 	if len(o.opts.extensionPlugins) > 0 {
-		if err := o.StartOsqueryExtensionManagerServer("kolide_initial", paths.extensionSocketPath, o.opts.extensionPlugins); err != nil {
+		if err := o.StartOsqueryExtensionManagerServer("kolide_grpc", paths.extensionSocketPath, o.opts.extensionPlugins); err != nil {
 			level.Info(o.logger).Log("msg", "Unable to create initial extension server. Stopping", "err", err)
 			return errors.Wrap(err, "could not create an extension server")
 		}

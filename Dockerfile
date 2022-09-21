@@ -12,7 +12,7 @@ LABEL maintainer="engineering@kolide.co"
 ARG FAKE
 
 # Default version to build
-ARG gitver=master
+ARG gitver=main
 
 # The launcher build is generally not GOPATH, however, we do assume
 # that the notary files are there. Eg, we hardcode paths.
@@ -31,7 +31,7 @@ RUN cd launcher && git checkout "${gitver}"
 # Build!
 RUN cd launcher && make deps
 RUN cd launcher && make all
-RUN cd launcher && GO111MODULE=on go run cmd/make/make.go -targets=launcher,osquery-extension.ext -linkstamp $FAKE
+RUN cd launcher && GO111MODULE=on go run cmd/make/make.go -targets=launcher -linkstamp $FAKE
 
 # Install
 RUN mkdir -p /usr/local/kolide/bin/
