@@ -9,10 +9,13 @@ import (
 	"github.com/knightsc/system_policy/osquery/table/legacyexec"
 	"github.com/kolide/launcher/pkg/osquery/tables/airport"
 	appicons "github.com/kolide/launcher/pkg/osquery/tables/app-icons"
+	"github.com/kolide/launcher/pkg/osquery/tables/apple_silicon_security_policy"
 	"github.com/kolide/launcher/pkg/osquery/tables/dataflattentable"
+	"github.com/kolide/launcher/pkg/osquery/tables/execparsers/remotectl"
 	"github.com/kolide/launcher/pkg/osquery/tables/filevault"
 	"github.com/kolide/launcher/pkg/osquery/tables/firmwarepasswd"
 	"github.com/kolide/launcher/pkg/osquery/tables/ioreg"
+	"github.com/kolide/launcher/pkg/osquery/tables/macos_software_update"
 	"github.com/kolide/launcher/pkg/osquery/tables/mdmclient"
 	"github.com/kolide/launcher/pkg/osquery/tables/munki"
 	"github.com/kolide/launcher/pkg/osquery/tables/osquery_user_exec_table"
@@ -79,7 +82,9 @@ func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, c
 		GDriveSyncHistoryInfo(client, logger),
 		KolideVulnerabilities(client, logger),
 		MDMInfo(logger),
-		MacOSUpdate(client),
+		macos_software_update.MacOSUpdate(client),
+		macos_software_update.RecommendedUpdates(logger),
+		macos_software_update.AvailableProducts(logger),
 		MachoInfo(),
 		Spotlight(),
 		TouchIDUserConfig(client, logger),
@@ -91,6 +96,7 @@ func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, c
 		kextpolicy.TablePlugin(),
 		filevault.TablePlugin(client, logger),
 		mdmclient.TablePlugin(client, logger),
+		apple_silicon_security_policy.TablePlugin(logger),
 		legacyexec.TablePlugin(),
 		dataflattentable.TablePluginExec(client, logger,
 			"kolide_diskutil_list", dataflattentable.PlistType, []string{"/usr/sbin/diskutil", "list", "-plist"}),
@@ -109,5 +115,6 @@ func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, c
 		systemprofiler.TablePlugin(client, logger),
 		munki.ManagedInstalls(client, logger),
 		munki.MunkiReport(client, logger),
+		dataflattentable.NewExecAndParseTable(logger, "kolide_remotectl", remotectl.Parser, []string{`/usr/libexec/remotectl`, `dumpstate`}),
 	}
 }

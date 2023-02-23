@@ -2,6 +2,8 @@ package localserver
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/tls"
 	_ "embed"
@@ -15,6 +17,8 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/krypto"
+	"github.com/kolide/krypto/pkg/echelper"
+	"github.com/kolide/launcher/pkg/agent"
 	"github.com/kolide/launcher/pkg/backoff"
 	"github.com/kolide/launcher/pkg/osquery"
 	"go.etcd.io/bbolt"
@@ -42,11 +46,14 @@ type localServer struct {
 	limiter      *rate.Limiter
 	tlsCerts     []tls.Certificate
 	querier      Querier
-	allowNoAuth  bool
 	kolideServer string
 
-	myKey     *rsa.PrivateKey
-	serverKey *rsa.PublicKey
+	myKey                 *rsa.PrivateKey
+	myLocalDbSigner       crypto.Signer
+	myLocalHardwareSigner crypto.Signer
+
+	serverKey   *rsa.PublicKey
+	serverEcKey *ecdsa.PublicKey
 }
 
 const (
@@ -56,9 +63,11 @@ const (
 
 func New(logger log.Logger, db *bbolt.DB, kolideServer string) (*localServer, error) {
 	ls := &localServer{
-		logger:       log.With(logger, "component", "localserver"),
-		limiter:      rate.NewLimiter(defaultRateLimit, defaultRateBurst),
-		kolideServer: kolideServer,
+		logger:                log.With(logger, "component", "localserver"),
+		limiter:               rate.NewLimiter(defaultRateLimit, defaultRateBurst),
+		kolideServer:          kolideServer,
+		myLocalDbSigner:       agent.LocalDbKeys(),
+		myLocalHardwareSigner: agent.HardwareKeys(),
 	}
 
 	// TODO: As there may be things that adjust the keys during runtime, we need to persist that across
@@ -68,40 +77,34 @@ func New(logger log.Logger, db *bbolt.DB, kolideServer string) (*localServer, er
 	}
 
 	// Consider polling this on an interval, so we get updates.
-	privateKey, err := osquery.PrivateKeyFromDB(db)
+	privateKey, err := osquery.PrivateRSAKeyFromDB(db)
 	if err != nil {
 		return nil, fmt.Errorf("fetching private key: %w", err)
 	}
 	ls.myKey = privateKey
 
-	// Setup the krypto boxer middleware. This will be used for the http auth
-	kbm, err := NewKryptoBoxerMiddleware(ls.logger, ls.myKey, ls.serverKey)
-	if err != nil {
-		return nil, fmt.Errorf("creating krypto boxer middlware: %w", err)
-	}
-
-	authedMux := http.NewServeMux()
-	authedMux.HandleFunc("/", http.NotFound)
-	authedMux.HandleFunc("/ping", pongHandler)
-	authedMux.Handle("/id", kbm.Wrap(ls.requestIdHandler()))
-	authedMux.Handle("/id.png", kbm.WrapPng(ls.requestIdHandler()))
+	ecKryptoMiddleware := newKryptoEcMiddleware(ls.logger, ls.myLocalDbSigner, ls.myLocalHardwareSigner, *ls.serverEcKey)
+	ecAuthedMux := http.NewServeMux()
+	ecAuthedMux.HandleFunc("/", http.NotFound)
+	ecAuthedMux.Handle("/id", ls.requestIdHandler())
+	ecAuthedMux.Handle("/id.png", ls.requestIdHandler())
+	ecAuthedMux.Handle("/query", ls.requestQueryHandler())
+	ecAuthedMux.Handle("/query.png", ls.requestQueryHandler())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", http.NotFound)
-	mux.Handle("/v0/cmd", kbm.UnwrapV1Hander(ls.requestLoggingHandler(authedMux)))
+	mux.Handle("/v0/cmd", ecKryptoMiddleware.Wrap(ecAuthedMux))
 
-	// Generally we wouldn't run without auth in production. But some debugging usage might enable it
-	if ls.allowNoAuth {
-		mux.HandleFunc("/ping", pongHandler)
-		mux.Handle("/id", kbm.Wrap(ls.requestIdHandler()))
-		mux.Handle("/id.png", kbm.WrapPng(ls.requestIdHandler()))
-	}
+	// uncomment to test without going through middleware
+	// for example:
+	// curl localhost:40978/query --data '{"query":"select * from kolide_launcher_info"}'
+	// mux.Handle("/query", ls.requestQueryHandler())
 
 	srv := &http.Server{
 		Handler:           ls.requestLoggingHandler(ls.preflightCorsHandler(ls.rateLimitHandler(mux))),
 		ReadTimeout:       500 * time.Millisecond,
 		ReadHeaderTimeout: 50 * time.Millisecond,
-		WriteTimeout:      50 * time.Millisecond,
+		WriteTimeout:      5 * time.Second,
 		MaxHeaderBytes:    1024,
 	}
 
@@ -119,15 +122,18 @@ func (ls *localServer) LoadDefaultKeyIfNotSet() error {
 		return nil
 	}
 
-	serverCertPem := k2ServerCert
+	serverRsaCertPem := k2RsaServerCert
+	serverEccCertPem := k2EccServerCert
 	switch {
 	case strings.HasPrefix(ls.kolideServer, "localhost"), strings.HasPrefix(ls.kolideServer, "127.0.0.1"):
-		serverCertPem = localhostServerCert
+		serverRsaCertPem = localhostRsaServerCert
+		serverEccCertPem = localhostEccServerCert
 	case strings.HasSuffix(ls.kolideServer, ".herokuapp.com"):
-		serverCertPem = reviewServerCert
+		serverRsaCertPem = reviewRsaServerCert
+		serverEccCertPem = reviewEccServerCert
 	}
 
-	serverKeyRaw, err := krypto.KeyFromPem([]byte(serverCertPem))
+	serverKeyRaw, err := krypto.KeyFromPem([]byte(serverRsaCertPem))
 	if err != nil {
 		return fmt.Errorf("parsing default public key: %w", err)
 	}
@@ -138,6 +144,11 @@ func (ls *localServer) LoadDefaultKeyIfNotSet() error {
 	}
 
 	ls.serverKey = serverKey
+
+	ls.serverEcKey, err = echelper.PublicPemToEcdsaKey([]byte(serverEccCertPem))
+	if err != nil {
+		return fmt.Errorf("parsing default server ec key: %w", err)
+	}
 
 	return nil
 }
@@ -259,13 +270,6 @@ func (ls *localServer) startListener() (net.Listener, error) {
 	}
 
 	return nil, errors.New("unable to bind to a local port")
-}
-
-func pongHandler(res http.ResponseWriter, req *http.Request) {
-	res.Header().Set("Content-Type", "application/json")
-
-	data := []byte(`{"ping": "Kolide"}` + "\n")
-	res.Write(data)
 }
 
 func (ls *localServer) preflightCorsHandler(next http.Handler) http.Handler {

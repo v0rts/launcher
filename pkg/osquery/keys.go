@@ -6,10 +6,9 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
-
-	"github.com/pkg/errors"
 )
 
 // This file is temporary, until we bring in a new library for v0.13
@@ -75,4 +74,16 @@ func KeyFromPem(pemRaw []byte) (interface{}, error) {
 	}
 
 	return nil, fmt.Errorf("Unknown block type: %s", block.Type)
+}
+
+func PublicKeyToPem(pub any, out io.Writer) error {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return fmt.Errorf("pkix marshalling: %w", err)
+	}
+
+	return pem.Encode(out, &pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: der,
+	})
 }

@@ -4,26 +4,28 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/kolide/kit/fsutil"
 	"github.com/kolide/kit/logutil"
+	"github.com/kolide/kit/ulid"
 	"github.com/kolide/kit/version"
 	"github.com/kolide/launcher/cmd/launcher/internal"
 	"github.com/kolide/launcher/cmd/launcher/internal/updater"
-	desktopRuntime "github.com/kolide/launcher/ee/desktop/runtime"
+	"github.com/kolide/launcher/ee/control"
+	"github.com/kolide/launcher/ee/control/consumers/notificationconsumer"
+	desktopRunner "github.com/kolide/launcher/ee/desktop/runner"
 	"github.com/kolide/launcher/ee/localserver"
+	"github.com/kolide/launcher/pkg/agent"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 	"github.com/kolide/launcher/pkg/debug"
 	"github.com/kolide/launcher/pkg/launcher"
@@ -32,7 +34,7 @@ import (
 	osqueryInstanceHistory "github.com/kolide/launcher/pkg/osquery/runtime/history"
 	"github.com/kolide/launcher/pkg/service"
 	"github.com/oklog/run"
-	"github.com/pkg/errors"
+
 	"go.etcd.io/bbolt"
 )
 
@@ -46,11 +48,9 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 	// determine the root directory, create one if it's not provided
 	rootDirectory := opts.RootDirectory
 	if rootDirectory == "" {
-		rootDirectory = filepath.Join(os.TempDir(), defaultRootDirectory)
-		if _, err := os.Stat(rootDirectory); os.IsNotExist(err) {
-			if err := os.Mkdir(rootDirectory, fsutil.DirMode); err != nil {
-				return errors.Wrap(err, "creating temporary root directory")
-			}
+		rootDirectory, err := agent.MkdirTemp(defaultRootDirectory)
+		if err != nil {
+			return fmt.Errorf("creating temporary root directory: %w", err)
 		}
 		level.Info(logger).Log(
 			"msg", "using default system root directory",
@@ -59,11 +59,11 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 	}
 
 	if err := os.MkdirAll(rootDirectory, 0700); err != nil {
-		return errors.Wrap(err, "creating root directory")
+		return fmt.Errorf("creating root directory: %w", err)
 	}
 
 	if _, err := osquery.DetectPlatform(); err != nil {
-		return errors.Wrap(err, "detecting platform")
+		return fmt.Errorf("detecting platform: %w", err)
 	}
 
 	debugAddrPath := filepath.Join(rootDirectory, "debug_addr")
@@ -90,12 +90,12 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 	boltOptions := &bbolt.Options{Timeout: time.Duration(30) * time.Second}
 	db, err := bbolt.Open(filepath.Join(rootDirectory, "launcher.db"), 0600, boltOptions)
 	if err != nil {
-		return errors.Wrap(err, "open launcher db")
+		return fmt.Errorf("open launcher db: %w", err)
 	}
 	defer db.Close()
 
 	if err := writePidFile(filepath.Join(rootDirectory, "launcher.pid")); err != nil {
-		return errors.Wrap(err, "write launcher pid to file")
+		return fmt.Errorf("write launcher pid to file: %w", err)
 	}
 
 	// If we have successfully opened the DB, and written a pid,
@@ -110,12 +110,12 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 	var rootPool *x509.CertPool
 	if opts.RootPEM != "" {
 		rootPool = x509.NewCertPool()
-		pemContents, err := ioutil.ReadFile(opts.RootPEM)
+		pemContents, err := os.ReadFile(opts.RootPEM)
 		if err != nil {
-			return errors.Wrapf(err, "reading root certs PEM at path: %s", opts.RootPEM)
+			return fmt.Errorf("reading root certs PEM at path: %s: %w", opts.RootPEM, err)
 		}
 		if ok := rootPool.AppendCertsFromPEM(pemContents); !ok {
-			return errors.Errorf("found no valid certs in PEM at path: %s", opts.RootPEM)
+			return fmt.Errorf("found no valid certs in PEM at path: %s", opts.RootPEM)
 		}
 	}
 	// create a rungroup for all the actors we create to allow for easy start/stop
@@ -146,12 +146,10 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		case "grpc":
 			grpcConn, err := service.DialGRPC(opts.KolideServerURL, opts.InsecureTLS, opts.InsecureTransport, opts.CertPins, rootPool, logger)
 			if err != nil {
-				return errors.Wrap(err, "dialing grpc server")
+				return fmt.Errorf("dialing grpc server: %w", err)
 			}
 			defer grpcConn.Close()
 			client = service.NewGRPCClient(grpcConn, logger)
-			queryTargeter := createQueryTargetUpdater(logger, db, grpcConn)
-			runGroup.Add(queryTargeter.Execute, queryTargeter.Interrupt)
 		case "jsonrpc":
 			client = service.NewJSONRPCClient(opts.KolideServerURL, opts.InsecureTLS, opts.InsecureTransport, opts.CertPins, rootPool, logger)
 		case "osquery":
@@ -163,13 +161,13 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 
 	// init osquery instance history
 	if err := osqueryInstanceHistory.InitHistory(db); err != nil {
-		return errors.Wrap(err, "error initializing osquery instance history")
+		return fmt.Errorf("error initializing osquery instance history: %w", err)
 	}
 
 	// create the osquery extension for launcher. This is where osquery itself is launched.
 	extension, runnerRestart, runnerShutdown, err := createExtensionRuntime(ctx, db, client, opts)
 	if err != nil {
-		return errors.Wrap(err, "create extension with runtime")
+		return fmt.Errorf("create extension with runtime: %w", err)
 	}
 	runGroup.Add(extension.Execute, extension.Interrupt)
 
@@ -180,29 +178,60 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		"build", versionInfo.Revision,
 	)
 
-	// If the control server has been opted-in to, run it
-	if opts.Control {
-		control, err := createControl(ctx, db, logger, opts)
+	// Create the control service and services that depend on it
+	var runner *desktopRunner.DesktopUsersProcessesRunner
+	if opts.ControlServerURL == "" {
+		level.Debug(logger).Log("msg", "control server URL not set, will not create control service")
+	} else {
+		controlService, err := createControlService(ctx, logger, db, opts)
 		if err != nil {
-			return errors.Wrap(err, "create control actor")
+			return fmt.Errorf("failed to setup control service: %w", err)
 		}
-		if control != nil {
-			runGroup.Add(control.Execute, control.Interrupt)
-		} else {
-			level.Info(logger).Log("msg", "got nil control actor. Ignoring")
-		}
-	}
+		runGroup.Add(controlService.ExecuteWithContext(ctx), controlService.Interrupt)
 
-	var desktopRunner *desktopRuntime.DesktopUsersProcessesRunner
-	if (opts.KolideServerURL == "k2device-preprod.kolide.com" || opts.KolideServerURL == "localhost:3443") && runtime.GOOS != "linux" {
-		desktopRunner = desktopRuntime.New(logger, time.Second*5, opts.KolideServerURL)
-		runGroup.Add(desktopRunner.Execute, desktopRunner.Interrupt)
+		// serverDataBucketConsumer handles server data table updates
+		serverDataBucketConsumer := control.NewBucketConsumer(logger, db, osquery.ServerProvidedDataBucket)
+		controlService.RegisterConsumer("kolide_server_data", serverDataBucketConsumer)
+
+		desktopFlagsBucketConsumer := control.NewBucketConsumer(logger, db, "agent_flags")
+		controlService.RegisterConsumer("agent_flags", desktopFlagsBucketConsumer)
+
+		runner = desktopRunner.New(
+			desktopRunner.WithLogger(logger),
+			desktopRunner.WithUpdateInterval(time.Second*5),
+			desktopRunner.WithHostname(opts.KolideServerURL),
+			desktopRunner.WithAuthToken(ulid.New()),
+			desktopRunner.WithUsersFilesRoot(rootDirectory),
+			desktopRunner.WithProcessSpawningEnabled(opts.KolideServerURL == "k2device-preprod.kolide.com" || opts.KolideServerURL == "localhost:3443" || opts.KolideServerURL == "localhost:3000" || strings.HasSuffix(opts.KolideServerURL, "herokuapp.com")),
+			desktopRunner.WithGetter(desktopFlagsBucketConsumer),
+		)
+		runGroup.Add(runner.Execute, runner.Interrupt)
+		controlService.RegisterConsumer("kolide_desktop_menu", runner)
+		controlService.RegisterSubscriber("agent_flags", runner)
+
+		// Run the notification service
+		notificationConsumer, err := notificationconsumer.NewNotifyConsumer(
+			db,
+			runner,
+			ctx,
+			notificationconsumer.WithLogger(logger),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to set up notifier: %w", err)
+		}
+		// Runs the cleanup routine for old notification records
+		runGroup.Add(notificationConsumer.Execute, notificationConsumer.Interrupt)
+
+		if err := controlService.RegisterConsumer(notificationconsumer.NotificationSubsystem, notificationConsumer); err != nil {
+			return fmt.Errorf("failed to register notify consumer: %w", err)
+		}
 	}
 
 	if opts.KolideServerURL == "k2device.kolide.com" ||
 		opts.KolideServerURL == "k2device-preprod.kolide.com" ||
 		opts.KolideServerURL == "localhost:3443" ||
 		strings.HasSuffix(opts.KolideServerURL, "herokuapp.com") {
+
 		ls, err := localserver.New(logger, db, opts.KolideServerURL)
 		if err != nil {
 			// For now, log this and move on. It might be a fatal error
@@ -231,7 +260,7 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		// create an updater for osquery
 		osqueryUpdater, err := updater.NewUpdater(ctx, opts.OsquerydPath, runnerRestart, osqueryUpdaterconfig)
 		if err != nil {
-			return errors.Wrap(err, "create osquery updater")
+			return fmt.Errorf("create osquery updater: %w", err)
 		}
 		runGroup.Add(osqueryUpdater.Execute, osqueryUpdater.Interrupt)
 
@@ -258,24 +287,29 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 			launcherPath,
 			updater.UpdateFinalizer(logger, func() error {
 				// stop desktop on auto updates
-				if desktopRunner != nil {
-					desktopRunner.Interrupt(nil)
+				if runner != nil {
+					runner.Interrupt(nil)
 				}
 				return runnerShutdown()
 			}),
 			launcherUpdaterconfig,
 		)
 		if err != nil {
-			return errors.Wrap(err, "create launcher updater")
+			return fmt.Errorf("create launcher updater: %w", err)
 		}
 		runGroup.Add(launcherUpdater.Execute, launcherUpdater.Interrupt)
 	}
 
-	err = runGroup.Run()
-	return errors.Wrap(err, "run service")
+	if err := runGroup.Run(); err != nil {
+		return fmt.Errorf("run service: %w", err)
+	}
+
+	return nil
 }
 
 func writePidFile(path string) error {
-	err := ioutil.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0600)
-	return errors.Wrap(err, "writing pidfile")
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+		return fmt.Errorf("writing pidfile: %w", err)
+	}
+	return nil
 }

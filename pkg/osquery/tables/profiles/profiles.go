@@ -13,19 +13,19 @@ package profiles
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/kolide/launcher/pkg/agent"
 	"github.com/kolide/launcher/pkg/dataflatten"
 	"github.com/kolide/launcher/pkg/osquery/tables/dataflattentable"
 	"github.com/kolide/launcher/pkg/osquery/tables/tablehelpers"
 	"github.com/osquery/osquery-go"
 	"github.com/osquery/osquery-go/plugin/table"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -77,9 +77,9 @@ func (t *Table) generate(ctx context.Context, queryContext table.QueryContext) (
 					// for some subset of the profiles command. I've reported it
 					// to apple (feedback FB8962811), and while it may someday
 					// be fixed, we need to support it where it is.
-					dir, err := ioutil.TempDir("", "kolide_profiles")
+					dir, err := agent.MkdirTemp("kolide_profiles")
 					if err != nil {
-						return nil, errors.Wrap(err, "creating kolide_profiles tmp dir")
+						return nil, fmt.Errorf("creating kolide_profiles tmp dir: %w", err)
 					}
 					defer os.RemoveAll(dir)
 
@@ -104,7 +104,7 @@ func (t *Table) generate(ctx context.Context, queryContext table.QueryContext) (
 					case user != "":
 						profileArgs = append(profileArgs, "-user", user)
 					default:
-						return nil, errors.Errorf("Unknown user argument: %s", user)
+						return nil, fmt.Errorf("Unknown user argument: %s", user)
 					}
 
 					output, err := tablehelpers.Exec(ctx, t.logger, 30, []string{profilesPath}, profileArgs)

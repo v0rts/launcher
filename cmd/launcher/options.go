@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -15,7 +16,6 @@ import (
 	"github.com/kolide/launcher/pkg/autoupdate"
 	"github.com/kolide/launcher/pkg/launcher"
 	"github.com/peterbourgon/ff/v3"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -45,25 +45,24 @@ func parseOptions(args []string) (*launcher.Options, error) {
 
 	var (
 		// Primary options
-		flAutoloadedExtensions arrayFlags
-		flCertPins             = flagset.String("cert_pins", "", "Comma separated, hex encoded SHA256 hashes of pinned subject public key info")
-		flControl              = flagset.Bool("control", false, "Whether or not the control server is enabled (default: false)")
-		flControlServerURL     = flagset.String("control_hostname", "", "The hostname of the control server")
-		flEnrollSecret         = flagset.String("enroll_secret", "", "The enroll secret that is used in your environment")
-		flEnrollSecretPath     = flagset.String("enroll_secret_path", "", "Optionally, the path to your enrollment secret")
-		flInitialRunner        = flagset.Bool("with_initial_runner", false, "Run differential queries from config ahead of scheduled interval.")
-		flKolideServerURL      = flagset.String("hostname", "", "The hostname of the gRPC server")
-		flKolideHosted         = flagset.Bool("kolide_hosted", false, "Use Kolide SaaS settings for defaults")
-		flTransport            = flagset.String("transport", "grpc", "The transport protocol that should be used to communicate with remote (default: grpc)")
-		flLoggingInterval      = flagset.Duration("logging_interval", 60*time.Second, "The interval at which logs should be flushed to the server")
-		flOsquerydPath         = flagset.String("osqueryd_path", "", "Path to the osqueryd binary to use (Default: find osqueryd in $PATH)")
-		flRootDirectory        = flagset.String("root_directory", "", "The location of the local database, pidfiles, etc.")
-		flRootPEM              = flagset.String("root_pem", "", "Path to PEM file including root certificates to verify against")
-		flVersion              = flagset.Bool("version", false, "Print Launcher version and exit")
-		flLogMaxBytesPerBatch  = flagset.Int("log_max_bytes_per_batch", 0, "Maximum size of a batch of logs. Recommend leaving unset, and launcher will determine")
-		flOsqueryFlags         arrayFlags // set below with flagset.Var
-		flCompactDbMaxTx       = flagset.Int64("compactdb-max-tx", 65536, "Maximum transaction size used when compacting the internal DB")
-		_                      = flagset.String("config", "", "config file to parse options from (optional)")
+		flAutoloadedExtensions   arrayFlags
+		flCertPins               = flagset.String("cert_pins", "", "Comma separated, hex encoded SHA256 hashes of pinned subject public key info")
+		flControlRequestInterval = flagset.Duration("control_request_interval", 60*time.Second, "The interval at which the control server requests will be made")
+		flEnrollSecret           = flagset.String("enroll_secret", "", "The enroll secret that is used in your environment")
+		flEnrollSecretPath       = flagset.String("enroll_secret_path", "", "Optionally, the path to your enrollment secret")
+		flInitialRunner          = flagset.Bool("with_initial_runner", false, "Run differential queries from config ahead of scheduled interval.")
+		flKolideServerURL        = flagset.String("hostname", "", "The hostname of the gRPC server")
+		flKolideHosted           = flagset.Bool("kolide_hosted", false, "Use Kolide SaaS settings for defaults")
+		flTransport              = flagset.String("transport", "grpc", "The transport protocol that should be used to communicate with remote (default: grpc)")
+		flLoggingInterval        = flagset.Duration("logging_interval", 60*time.Second, "The interval at which logs should be flushed to the server")
+		flOsquerydPath           = flagset.String("osqueryd_path", "", "Path to the osqueryd binary to use (Default: find osqueryd in $PATH)")
+		flRootDirectory          = flagset.String("root_directory", "", "The location of the local database, pidfiles, etc.")
+		flRootPEM                = flagset.String("root_pem", "", "Path to PEM file including root certificates to verify against")
+		flVersion                = flagset.Bool("version", false, "Print Launcher version and exit")
+		flLogMaxBytesPerBatch    = flagset.Int("log_max_bytes_per_batch", 0, "Maximum size of a batch of logs. Recommend leaving unset, and launcher will determine")
+		flOsqueryFlags           arrayFlags // set below with flagset.Var
+		flCompactDbMaxTx         = flagset.Int64("compactdb-max-tx", 65536, "Maximum transaction size used when compacting the internal DB")
+		_                        = flagset.String("config", "", "config file to parse options from (optional)")
 
 		// osquery TLS endpoints
 		flOsqTlsConfig    = flagset.String("config_tls_endpoint", "", "Config endpoint for the osquery tls transport")
@@ -85,12 +84,14 @@ func parseOptions(args []string) (*launcher.Options, error) {
 		flDebug             = flagset.Bool("debug", false, "Whether or not debug logging is enabled (default: false)")
 		flOsqueryVerbose    = flagset.Bool("osquery_verbose", false, "Enable verbose osqueryd (default: false)")
 		flDeveloperUsage    = flagset.Bool("dev_help", false, "Print full Launcher help, including developer options")
-		flDisableControlTLS = flagset.Bool("disable_control_tls", false, "Disable TLS encryption for the control features")
 		flInsecureTransport = flagset.Bool("insecure_transport", false, "Do not use TLS for transport layer (default: false)")
 		flInsecureTLS       = flagset.Bool("insecure", false, "Do not verify TLS certs for outgoing connections (default: false)")
 
 		// deprecated options, kept for any kind of config file compatibility
 		_ = flagset.String("debug_log_file", "", "DEPRECATED")
+		_ = flagset.Bool("control", false, "DEPRECATED")
+		_ = flagset.String("control_hostname", "", "DEPRECATED")
+		_ = flagset.Bool("disable_control_tls", false, "Disable TLS encryption for the control features")
 	)
 
 	flagset.Var(&flOsqueryFlags, "osquery_flag", "Flags to pass to osquery (possibly overriding Launcher defaults)")
@@ -177,16 +178,37 @@ func parseOptions(args []string) (*launcher.Options, error) {
 		return nil, err
 	}
 
+	// Set control server URL and control server TLS settings based on Kolide server URL, defaulting to local server
+	controlServerURL := ""
+	insecureControlTLS := false
+	disableControlTLS := false
+	if *flKolideServerURL == "k2device.kolide.com" {
+		controlServerURL = "k2control.kolide.com"
+	} else if *flKolideServerURL == "k2device-preprod.kolide.com" {
+		controlServerURL = "k2control-preprod.kolide.com"
+	} else if strings.HasSuffix(*flKolideServerURL, "herokuapp.com") {
+		controlServerURL = *flKolideServerURL
+	} else if *flKolideServerURL == "localhost:3443" {
+		controlServerURL = *flKolideServerURL
+		// We don't plumb flRootPEM through to the control server, just disable TLS for now
+		insecureControlTLS = true
+	} else if *flKolideServerURL == "localhost:3000" {
+		controlServerURL = *flKolideServerURL
+		disableControlTLS = true
+	}
+
 	opts := &launcher.Options{
 		Autoupdate:                         *flAutoupdate,
 		AutoupdateInterval:                 *flAutoupdateInterval,
 		AutoupdateInitialDelay:             *flAutoupdateInitialDelay,
 		CertPins:                           certPins,
 		CompactDbMaxTx:                     *flCompactDbMaxTx,
-		Control:                            *flControl,
-		ControlServerURL:                   *flControlServerURL,
+		Control:                            false,
+		ControlServerURL:                   controlServerURL,
+		ControlRequestInterval:             *flControlRequestInterval,
 		Debug:                              *flDebug,
-		DisableControlTLS:                  *flDisableControlTLS,
+		DisableControlTLS:                  disableControlTLS,
+		InsecureControlTLS:                 insecureControlTLS,
 		EnableInitialRunner:                *flInitialRunner,
 		EnrollSecret:                       *flEnrollSecret,
 		EnrollSecretPath:                   *flEnrollSecretPath,
@@ -251,9 +273,6 @@ func shortUsage(flagset *flag.FlagSet) {
 	fmt.Fprintf(os.Stderr, "\n")
 	printOpt("autoupdate")
 	fmt.Fprintf(os.Stderr, "\n")
-	printOpt("control")
-	printOpt("control_hostname")
-	fmt.Fprintf(os.Stderr, "\n")
 	printOpt("version")
 	fmt.Fprintf(os.Stderr, "\n")
 	if !skipEnvParse {
@@ -306,7 +325,6 @@ func developerUsage(flagset *flag.FlagSet) {
 	printOpt("notary_prefix")
 	fmt.Fprintf(os.Stderr, "\n")
 	printOpt("control_get_shells_interval")
-	printOpt("disable_control_tls")
 	fmt.Fprintf(os.Stderr, "\n")
 	printOpt("osquery_flag")
 	fmt.Fprintf(os.Stderr, "\n")
@@ -324,7 +342,7 @@ func parseCertPins(pins string) ([][]byte, error) {
 		for _, hexPin := range strings.Split(pins, ",") {
 			pin, err := hex.DecodeString(hexPin)
 			if err != nil {
-				return nil, errors.Wrap(err, "decoding cert pin")
+				return nil, fmt.Errorf("decoding cert pin: %w", err)
 			}
 			certPins = append(certPins, pin)
 		}

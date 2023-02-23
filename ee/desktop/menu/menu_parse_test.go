@@ -1,0 +1,130 @@
+package menu
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+type testMenuBuilder struct {
+	Icon     menuIcon
+	Tooltip  string
+	parent   any
+	itemCopy *menuItemData
+	menuCopy MenuData
+}
+
+func (m *testMenuBuilder) setIcon(icon menuIcon) {
+	m.menuCopy.Icon = icon
+}
+
+func (m *testMenuBuilder) setTooltip(tooltip string) {
+	m.menuCopy.Tooltip = tooltip
+}
+
+func (m *testMenuBuilder) addMenuItem(label, tooltip string, disabled bool, ap ActionPerformer, parent any) any {
+	item := &menuItemData{
+		Label:    label,
+		Tooltip:  tooltip,
+		Disabled: disabled,
+	}
+
+	if parent != nil {
+		m.itemCopy.Items = append(m.itemCopy.Items, *item)
+		return m.parent
+	} else {
+		m.itemCopy = item
+	}
+
+	return m.parent
+}
+
+func (m *testMenuBuilder) addSeparator() {
+	m.itemCopy = &menuItemData{
+		Separator: true,
+	}
+}
+
+func Test_ParseMenuData(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data *MenuData
+	}{
+		{
+			name: "nil",
+		},
+		{
+			name: "default",
+			data: &MenuData{},
+		},
+		{
+			name: "happy path",
+			data: &MenuData{
+				Icon:    DefaultIcon,
+				Tooltip: "Kolide",
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			builder := &testMenuBuilder{}
+			parseMenuData(tt.data, builder)
+			if tt.data != nil {
+				assert.Equal(t, *tt.data, builder.menuCopy)
+			}
+		})
+	}
+}
+
+func Test_ParseMenuItem(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data *menuItemData
+	}{
+		{
+			name: "nil",
+		},
+		{
+			name: "default",
+			data: &menuItemData{Label: "something"},
+		},
+		{
+			name: "one item",
+			data: &menuItemData{Label: "first item"},
+		},
+		{
+			name: "separator",
+			data: &menuItemData{Separator: true},
+		},
+		{
+			name: "submenu",
+			data: &menuItemData{
+				Label: "parent",
+				Items: []menuItemData{
+					{Label: "first item"},
+					{Label: "second item"},
+				}},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			builder := &testMenuBuilder{parent: menuItemData{Label: "parent item"}}
+			parseMenuItem(tt.data, builder, nil)
+			if tt.data == nil {
+				assert.Equal(t, tt.data, builder.itemCopy)
+			} else {
+				assert.Equal(t, *tt.data, *builder.itemCopy)
+			}
+		})
+	}
+}

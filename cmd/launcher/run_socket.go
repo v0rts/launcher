@@ -10,9 +10,9 @@ import (
 
 	"github.com/kolide/kit/env"
 	"github.com/kolide/kit/fsutil"
+	"github.com/kolide/launcher/pkg/agent"
 	"github.com/kolide/launcher/pkg/osquery/runtime"
 	"github.com/kolide/launcher/pkg/osquery/table"
-	"github.com/pkg/errors"
 )
 
 func runSocket(args []string) error {
@@ -20,7 +20,7 @@ func runSocket(args []string) error {
 	var (
 		flPath = flagset.String(
 			"path",
-			env.String("SOCKET_PATH", filepath.Join(os.TempDir(), "osquery.sock")),
+			env.String("SOCKET_PATH", agent.TempPath("osquery.sock")),
 			"The path to the socket",
 		)
 		flLauncherTables = flagset.Bool(
@@ -36,7 +36,7 @@ func runSocket(args []string) error {
 
 	if _, err := os.Stat(filepath.Dir(*flPath)); os.IsNotExist(err) {
 		if err := os.Mkdir(filepath.Dir(*flPath), fsutil.DirMode); err != nil {
-			return errors.Wrap(err, "creating socket path base directory")
+			return fmt.Errorf("creating socket path base directory: %w", err)
 		}
 	}
 
@@ -50,7 +50,7 @@ func runSocket(args []string) error {
 
 	runner, err := runtime.LaunchInstance(opts...)
 	if err != nil {
-		return errors.Wrap(err, "creating osquery instance")
+		return fmt.Errorf("creating osquery instance: %w", err)
 	}
 
 	fmt.Println(*flPath)
