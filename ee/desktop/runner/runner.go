@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	"github.com/kolide/launcher/ee/desktop/notify"
 	"github.com/kolide/launcher/ee/ui/assets"
 	"github.com/kolide/launcher/pkg/agent"
+	"github.com/kolide/launcher/pkg/agent/types"
 	"github.com/kolide/launcher/pkg/backoff"
 	"github.com/shirou/gopsutil/process"
 	"golang.org/x/exp/maps"
@@ -53,6 +55,13 @@ func WithLogger(logger log.Logger) desktopUsersProcessesRunnerOption {
 func WithUpdateInterval(interval time.Duration) desktopUsersProcessesRunnerOption {
 	return func(r *DesktopUsersProcessesRunner) {
 		r.updateInterval = interval
+	}
+}
+
+// WithMenuRefreshInterval sets the interval on which the runner will refresh the desktop menu
+func WithMenuRefreshInterval(interval time.Duration) desktopUsersProcessesRunnerOption {
+	return func(r *DesktopUsersProcessesRunner) {
+		r.menuRefreshInterval = interval
 	}
 }
 
@@ -93,9 +102,9 @@ func WithProcessSpawningEnabled(enabled bool) desktopUsersProcessesRunnerOption 
 }
 
 // WithGetter sets the key/value getter for agent flags
-func WithGetter(storedData agent.Getter) desktopUsersProcessesRunnerOption {
+func WithGetter(getter types.Getter) desktopUsersProcessesRunnerOption {
 	return func(r *DesktopUsersProcessesRunner) {
-		r.flagsGetter = storedData
+		r.flagsGetter = getter
 	}
 }
 
@@ -104,9 +113,12 @@ func WithGetter(storedData agent.Getter) desktopUsersProcessesRunnerOption {
 // will create a new one.
 // Initialize with New().
 type DesktopUsersProcessesRunner struct {
-	logger         log.Logger
+	logger log.Logger
+	// updateInterval is the interval on which desktop processes will be spawned, if necessary
 	updateInterval time.Duration
-	interrupt      chan struct{}
+	// menuRefreshInterval is the interval on which the desktop menu will be refreshed
+	menuRefreshInterval time.Duration
+	interrupt           chan struct{}
 	// uidProcs is a map of uid to desktop process
 	uidProcs map[string]processRecord
 	// procsWg is a WaitGroup to wait for all desktop processes to finish during an interrupt
@@ -129,7 +141,9 @@ type DesktopUsersProcessesRunner struct {
 	// This effectively represents whether or not the launcher desktop GUI is enabled or not
 	processSpawningEnabled bool
 	// flagsGetter gets agent flags
-	flagsGetter agent.Getter
+	flagsGetter types.Getter
+	// monitorServer is a local server that desktop processes call to monitor parent
+	monitorServer *monitorServer
 }
 
 // processRecord is used to track spawned desktop processes.
@@ -144,12 +158,13 @@ type processRecord struct {
 }
 
 // New creates and returns a new DesktopUsersProcessesRunner runner and initializes all required fields
-func New(opts ...desktopUsersProcessesRunnerOption) *DesktopUsersProcessesRunner {
+func New(opts ...desktopUsersProcessesRunnerOption) (*DesktopUsersProcessesRunner, error) {
 	runner := &DesktopUsersProcessesRunner{
 		logger:                 log.NewNopLogger(),
 		interrupt:              make(chan struct{}),
 		uidProcs:               make(map[string]processRecord),
 		updateInterval:         time.Second * 5,
+		menuRefreshInterval:    time.Minute * 15,
 		procsWg:                &sync.WaitGroup{},
 		interruptTimeout:       time.Second * 10,
 		usersFilesRoot:         agent.TempPath("kolide-desktop"),
@@ -162,25 +177,33 @@ func New(opts ...desktopUsersProcessesRunnerOption) *DesktopUsersProcessesRunner
 
 	runner.writeIconFile()
 	runner.writeDefaultMenuTemplateFile()
+	runner.refreshMenu()
 
-	// We re-generate the menu file each time launcher starts up, so it's always up-to-date
-	if err := runner.generateMenuFile(); err != nil {
-		if agent.Flags.DebugServerData() {
-			level.Error(runner.logger).Log(
-				"msg", "failed to generate menu file",
-				"error", err,
-			)
-		}
+	ms, err := newMonitorServer()
+	if err != nil {
+		return nil, err
 	}
 
-	return runner
+	runner.monitorServer = ms
+	go func() {
+		if err := runner.monitorServer.serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			level.Error(runner.logger).Log(
+				"msg", "running monitor server",
+				"err", err,
+			)
+		}
+	}()
+
+	return runner, nil
 }
 
 // Execute immediately checks if the current console user has a desktop process running. If not, it will start a new one.
 // Then repeats based on the executionInterval.
 func (r *DesktopUsersProcessesRunner) Execute() error {
-	ticker := time.NewTicker(r.updateInterval)
-	defer ticker.Stop()
+	updateTicker := time.NewTicker(r.updateInterval)
+	defer updateTicker.Stop()
+	menuRefreshTicker := time.NewTicker(r.menuRefreshInterval)
+	defer menuRefreshTicker.Stop()
 
 	for {
 		// Check immediately on each iteration, avoiding the initial ticker delay
@@ -189,7 +212,10 @@ func (r *DesktopUsersProcessesRunner) Execute() error {
 		}
 
 		select {
-		case <-ticker.C:
+		case <-updateTicker.C:
+			continue
+		case <-menuRefreshTicker.C:
+			r.refreshMenu()
 			continue
 		case <-r.interrupt:
 			level.Debug(r.logger).Log("msg", "interrupt received, exiting desktop execute loop")
@@ -211,6 +237,16 @@ func (r *DesktopUsersProcessesRunner) Interrupt(interruptError error) {
 
 	// Kill any desktop processes that may exist
 	r.killDesktopProcesses()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	if err := r.monitorServer.Shutdown(ctx); err != nil {
+		level.Error(r.logger).Log(
+			"msg", "shutting down monitor server",
+			"err", err,
+		)
+	}
 }
 
 // killDesktopProcesses kills any existing desktop processes
@@ -221,6 +257,7 @@ func (r *DesktopUsersProcessesRunner) killDesktopProcesses() {
 		r.procsWg.Wait()
 	}()
 
+	shutdownRequestCount := 0
 	for uid, proc := range r.uidProcs {
 		client := client.New(r.authToken, proc.socketPath)
 		if err := client.Shutdown(); err != nil {
@@ -231,12 +268,20 @@ func (r *DesktopUsersProcessesRunner) killDesktopProcesses() {
 				"path", proc.path,
 				"err", err,
 			)
+			continue
 		}
+		shutdownRequestCount++
 	}
 
 	select {
 	case <-wgDone:
-		level.Debug(r.logger).Log("msg", "all desktop processes shutdown successfully")
+		if shutdownRequestCount > 0 {
+			level.Debug(r.logger).Log(
+				"msg", "successfully completed desktop process shutdown requests",
+				"count", shutdownRequestCount,
+			)
+		}
+
 		maps.Clear(r.uidProcs)
 		return
 	case <-time.After(r.interruptTimeout):
@@ -264,16 +309,9 @@ func (r *DesktopUsersProcessesRunner) SendNotification(n notify.Notification) er
 	}
 
 	errs := make([]error, 0)
-	for uid, proc := range r.uidProcs {
+	for _, proc := range r.uidProcs {
 		client := client.New(r.authToken, proc.socketPath)
 		if err := client.Notify(n); err != nil {
-			level.Error(r.logger).Log(
-				"msg", "error sending notify command to desktop process",
-				"uid", uid,
-				"pid", proc.process.Pid,
-				"path", proc.path,
-				"err", err,
-			)
 			errs = append(errs, err)
 		}
 	}
@@ -305,37 +343,17 @@ func (r *DesktopUsersProcessesRunner) Update(data io.Reader) error {
 
 	// Regardless, we will write the menu data out to a file that can be grabbed by
 	// any desktop user processes, either when they refresh, or when they are spawned.
-	if err := r.generateMenuFile(); err != nil {
-		if agent.Flags.DebugServerData() {
-			level.Error(r.logger).Log(
-				"msg", "failed to generate menu file",
-				"error", err,
-				"data", dataCopy.String(),
-			)
-		}
-		return fmt.Errorf("failed to generate menu file: %w", err)
-	}
-
-	// Tell any running desktop user processes that they should refresh the latest menu data
-	for uid, proc := range r.uidProcs {
-		client := client.New(r.authToken, proc.socketPath)
-		if err := client.Refresh(); err != nil {
-			level.Error(r.logger).Log(
-				"msg", "error sending refresh command to desktop process",
-				"uid", uid,
-				"pid", proc.process.Pid,
-				"path", proc.path,
-				"err", err,
-			)
-		}
-	}
+	r.refreshMenu()
 
 	return nil
 }
 
 func (r *DesktopUsersProcessesRunner) Ping() {
 	// agent_flags bucket has been updated, query the flags to react to changes
-	enabledRaw, err := r.flagsGetter.Get([]byte("desktop_enabled"))
+	// This has a `v1` appended, because the menu data format went from v0 to v1 -- we
+	// added `hasCapability`. Doing this cleanly required a flag day. Future work will
+	// need to do something else, probably something where the menu data is versioned.
+	enabledRaw, err := r.flagsGetter.Get([]byte("desktop_enabled_v1"))
 	if err != nil {
 		level.Debug(r.logger).Log("msg", "failed to query desktop flags", "err", err)
 		return
@@ -345,7 +363,7 @@ func (r *DesktopUsersProcessesRunner) Ping() {
 	enabled := enabledRaw != nil
 
 	r.processSpawningEnabled = enabled
-	level.Debug(r.logger).Log("msg", "runner processSpawningEnabled:%s", strconv.FormatBool(enabled))
+	level.Debug(r.logger).Log("msg", fmt.Sprintf("runner processSpawningEnabled set by control server: %s", strconv.FormatBool(enabled)))
 }
 
 // writeSharedFile writes data to a shared file for user processes to access
@@ -366,6 +384,32 @@ func (r *DesktopUsersProcessesRunner) writeSharedFile(path string, data []byte) 
 	}
 
 	return nil
+}
+
+// refreshMenu updates the menu file and tells desktop processes to refresh their menus
+func (r *DesktopUsersProcessesRunner) refreshMenu() {
+	if err := r.generateMenuFile(); err != nil {
+		if agent.Flags.DebugServerData() {
+			level.Error(r.logger).Log(
+				"msg", "failed to generate menu file",
+				"error", err,
+			)
+		}
+	}
+
+	// Tell any running desktop user processes that they should refresh the latest menu data
+	for uid, proc := range r.uidProcs {
+		client := client.New(r.authToken, proc.socketPath)
+		if err := client.Refresh(); err != nil {
+			level.Error(r.logger).Log(
+				"msg", "error sending refresh command to desktop process",
+				"uid", uid,
+				"pid", proc.process.Pid,
+				"path", proc.path,
+				"err", err,
+			)
+		}
+	}
 }
 
 // generateMenuFile generates and writes menu data to a shared file
@@ -447,14 +491,12 @@ func (r *DesktopUsersProcessesRunner) runConsoleUserDesktop() error {
 			return fmt.Errorf("getting socket path: %w", err)
 		}
 
-		menuPath := r.menuPath()
-
-		cmd, err := r.desktopCommand(executablePath, uid, socketPath, menuPath)
+		cmd, err := r.desktopCommand(executablePath, uid, socketPath, r.menuPath(), r.monitorServer.newEndpoint())
 		if err != nil {
 			return fmt.Errorf("creating desktop command: %w", err)
 		}
 
-		if err := r.runAsUser(uid, cmd); err != nil {
+		if err := r.runAsUser(ctx, uid, cmd); err != nil {
 			return fmt.Errorf("running desktop command as user: %w", err)
 		}
 
@@ -632,7 +674,7 @@ func (r *DesktopUsersProcessesRunner) menuTemplatePath() string {
 }
 
 // desktopCommand invokes the launcher desktop executable with the appropriate env vars
-func (r *DesktopUsersProcessesRunner) desktopCommand(executablePath, uid, socketPath, menuPath string) (*exec.Cmd, error) {
+func (r *DesktopUsersProcessesRunner) desktopCommand(executablePath, uid, socketPath, menuPath, monitorUrl string) (*exec.Cmd, error) {
 	cmd := exec.Command(executablePath, "desktop")
 
 	cmd.Env = []string{
@@ -649,6 +691,7 @@ func (r *DesktopUsersProcessesRunner) desktopCommand(executablePath, uid, socket
 		fmt.Sprintf("ICON_PATH=%s", r.iconFileLocation()),
 		fmt.Sprintf("MENU_PATH=%s", menuPath),
 		fmt.Sprintf("PPID=%d", os.Getpid()),
+		fmt.Sprintf("MONITOR_URL=%s", monitorUrl),
 	}
 
 	stdErr, err := cmd.StderrPipe()

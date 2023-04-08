@@ -64,6 +64,8 @@ type Options struct {
 	Autoupdate bool
 	// NotaryServerURL is the URL for the Notary server.
 	NotaryServerURL string
+	// TufServerURL is the URL for the tuf server.
+	TufServerURL string
 	// MirrorServerURL is the URL for the Notary mirror.
 	MirrorServerURL string
 	// AutoupdateInterval is the interval at which Launcher will check for
@@ -95,4 +97,6 @@ type Options struct {
 	InsecureTransport bool
 	// CompactDbMaxTx sets the max transaction size for bolt db compaction operations
 	CompactDbMaxTx int64
+	// IAmBreakingEELicence disables the EE licence check before runnign the local server
+	IAmBreakingEELicense bool
 }

@@ -19,9 +19,9 @@ import (
 	"github.com/kolide/krypto"
 	"github.com/kolide/krypto/pkg/echelper"
 	"github.com/kolide/launcher/pkg/agent"
+	"github.com/kolide/launcher/pkg/agent/types"
 	"github.com/kolide/launcher/pkg/backoff"
 	"github.com/kolide/launcher/pkg/osquery"
-	"go.etcd.io/bbolt"
 	"golang.org/x/time/rate"
 )
 
@@ -33,6 +33,10 @@ var portList = []int{
 	22287,
 	60685,
 	22322,
+}
+
+type controlService interface {
+	AccelerateRequestInterval(interval, duration time.Duration)
 }
 
 type Querier interface {
@@ -54,6 +58,8 @@ type localServer struct {
 
 	serverKey   *rsa.PublicKey
 	serverEcKey *ecdsa.PublicKey
+
+	controlService controlService
 }
 
 const (
@@ -61,13 +67,31 @@ const (
 	defaultRateBurst = 10
 )
 
-func New(logger log.Logger, db *bbolt.DB, kolideServer string) (*localServer, error) {
+type LocalServerOption func(*localServer)
+
+func WithLogger(logger log.Logger) LocalServerOption {
+	return func(s *localServer) {
+		s.logger = log.With(logger, "component", "localserver")
+	}
+}
+
+func WithControlService(cs controlService) LocalServerOption {
+	return func(s *localServer) {
+		s.controlService = cs
+	}
+}
+
+func New(configStore types.Getter, kolideServer string, opts ...LocalServerOption) (*localServer, error) {
 	ls := &localServer{
-		logger:                log.With(logger, "component", "localserver"),
+		logger:                log.NewNopLogger(),
 		limiter:               rate.NewLimiter(defaultRateLimit, defaultRateBurst),
 		kolideServer:          kolideServer,
 		myLocalDbSigner:       agent.LocalDbKeys(),
 		myLocalHardwareSigner: agent.HardwareKeys(),
+	}
+
+	for _, o := range opts {
+		o(ls)
 	}
 
 	// TODO: As there may be things that adjust the keys during runtime, we need to persist that across
@@ -77,7 +101,7 @@ func New(logger log.Logger, db *bbolt.DB, kolideServer string) (*localServer, er
 	}
 
 	// Consider polling this on an interval, so we get updates.
-	privateKey, err := osquery.PrivateRSAKeyFromDB(db)
+	privateKey, err := osquery.PrivateRSAKeyFromDB(configStore)
 	if err != nil {
 		return nil, fmt.Errorf("fetching private key: %w", err)
 	}
@@ -86,26 +110,41 @@ func New(logger log.Logger, db *bbolt.DB, kolideServer string) (*localServer, er
 	ecKryptoMiddleware := newKryptoEcMiddleware(ls.logger, ls.myLocalDbSigner, ls.myLocalHardwareSigner, *ls.serverEcKey)
 	ecAuthedMux := http.NewServeMux()
 	ecAuthedMux.HandleFunc("/", http.NotFound)
+	ecAuthedMux.Handle("/acceleratecontrol", ls.requestAccelerateControlHandler())
+	ecAuthedMux.Handle("/acceleratecontrol.png", ls.requestAccelerateControlHandler())
 	ecAuthedMux.Handle("/id", ls.requestIdHandler())
 	ecAuthedMux.Handle("/id.png", ls.requestIdHandler())
 	ecAuthedMux.Handle("/query", ls.requestQueryHandler())
 	ecAuthedMux.Handle("/query.png", ls.requestQueryHandler())
+	ecAuthedMux.Handle("/scheduledquery", ls.requestScheduledQueryHandler())
+	ecAuthedMux.Handle("/scheduledquery.png", ls.requestScheduledQueryHandler())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", http.NotFound)
 	mux.Handle("/v0/cmd", ecKryptoMiddleware.Wrap(ecAuthedMux))
 
+	// /v1/cmd was added after fixing a bug where local server would panic when an endpoint was not found
+	// after making it through the kryptoEcMiddleware
+	// by using v1, k2 can call endpoints without fear of panicing local server
+	// /v0/cmd left for transition period
+	mux.Handle("/v1/cmd", ecKryptoMiddleware.Wrap(ecAuthedMux))
+
 	// uncomment to test without going through middleware
 	// for example:
 	// curl localhost:40978/query --data '{"query":"select * from kolide_launcher_info"}'
 	// mux.Handle("/query", ls.requestQueryHandler())
+	// curl localhost:40978/scheduledquery --data '{"name":"pack:kolide_device_updaters:agentprocesses-all:snapshot"}'
+	// mux.Handle("/scheduledquery", ls.requestScheduledQueryHandler())
+	// curl localhost:40978/acceleratecontrol  --data '{"interval":"250ms", "duration":"1s"}'
+	// mux.Handle("/acceleratecontrol", ls.requestAccelerateControlHandler())
 
 	srv := &http.Server{
 		Handler:           ls.requestLoggingHandler(ls.preflightCorsHandler(ls.rateLimitHandler(mux))),
 		ReadTimeout:       500 * time.Millisecond,
 		ReadHeaderTimeout: 50 * time.Millisecond,
-		WriteTimeout:      5 * time.Second,
-		MaxHeaderBytes:    1024,
+		// WriteTimeout very high due to retry logic in the scheduledquery endpoint
+		WriteTimeout:   30 * time.Second,
+		MaxHeaderBytes: 1024,
 	}
 
 	ls.srv = srv
@@ -125,12 +164,16 @@ func (ls *localServer) LoadDefaultKeyIfNotSet() error {
 	serverRsaCertPem := k2RsaServerCert
 	serverEccCertPem := k2EccServerCert
 	switch {
-	case strings.HasPrefix(ls.kolideServer, "localhost"), strings.HasPrefix(ls.kolideServer, "127.0.0.1"):
+	case strings.HasPrefix(ls.kolideServer, "localhost"), strings.HasPrefix(ls.kolideServer, "127.0.0.1"), strings.Contains(ls.kolideServer, ".ngrok."):
+		level.Debug(ls.logger).Log("msg", "using developer certificates")
 		serverRsaCertPem = localhostRsaServerCert
 		serverEccCertPem = localhostEccServerCert
 	case strings.HasSuffix(ls.kolideServer, ".herokuapp.com"):
+		level.Debug(ls.logger).Log("msg", "using review app certificates")
 		serverRsaCertPem = reviewRsaServerCert
 		serverEccCertPem = reviewEccServerCert
+	default:
+		level.Debug(ls.logger).Log("msg", "using default/production certificates")
 	}
 
 	serverKeyRaw, err := krypto.KeyFromPem([]byte(serverRsaCertPem))

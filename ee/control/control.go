@@ -6,24 +6,30 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/launcher/pkg/agent"
+	"github.com/kolide/launcher/pkg/agent/types"
 )
 
 // ControlService is the main object that manages the control service. It is responsible for fetching
 // and caching control data, and updating consumers and subscribers.
 type ControlService struct {
-	logger          log.Logger
-	cancel          context.CancelFunc
-	requestInterval time.Duration
-	fetcher         dataProvider
-	getset          agent.GetterSetter
-	lastFetched     map[string]string
-	consumers       map[string]consumer
-	subscribers     map[string][]subscriber
+	logger                   log.Logger
+	cancel                   context.CancelFunc
+	requestInterval          time.Duration
+	requestTicker            *time.Ticker
+	requestAccelerationTimer *time.Timer
+	minAccelerationInterval  time.Duration
+	fetcher                  dataProvider
+	fetchMutex               sync.Mutex
+	store                    types.GetterSetter
+	lastFetched              map[string]string
+	consumers                map[string]consumer
+	subscribers              map[string][]subscriber
 }
 
 // consumer is an interface for something that consumes control server data updates. The
@@ -45,15 +51,18 @@ type dataProvider interface {
 	GetSubsystemData(hash string) (io.Reader, error)
 }
 
-func New(logger log.Logger, ctx context.Context, fetcher dataProvider, opts ...Option) *ControlService {
+func New(logger log.Logger, fetcher dataProvider, opts ...Option) *ControlService {
 	cs := &ControlService{
-		logger:          log.With(logger, "component", "control"),
-		requestInterval: 60 * time.Second,
-		fetcher:         fetcher,
-		lastFetched:     make(map[string]string),
-		consumers:       make(map[string]consumer),
-		subscribers:     make(map[string][]subscriber),
+		logger:                  log.With(logger, "component", "control"),
+		requestInterval:         60 * time.Second,
+		minAccelerationInterval: 5 * time.Second,
+		fetcher:                 fetcher,
+		lastFetched:             make(map[string]string),
+		consumers:               make(map[string]consumer),
+		subscribers:             make(map[string][]subscriber),
 	}
+
+	cs.requestTicker = time.NewTicker(cs.requestInterval)
 
 	for _, opt := range opts {
 		opt(cs)
@@ -75,19 +84,18 @@ func (cs *ControlService) ExecuteWithContext(ctx context.Context) func() error {
 func (cs *ControlService) Start(ctx context.Context) {
 	level.Info(cs.logger).Log("msg", "control service started")
 	ctx, cs.cancel = context.WithCancel(ctx)
-	requestTicker := time.NewTicker(cs.requestInterval)
 	for {
 		// Fetch immediately on each iteration, avoiding the initial ticker delay
 		if err := cs.Fetch(); err != nil {
 			level.Debug(cs.logger).Log(
 				"msg", "failed to fetch data from control server. Not fatal, moving on",
-				"err", err)
+				"err", err,
+			)
 		}
-
 		select {
 		case <-ctx.Done():
 			return
-		case <-requestTicker.C:
+		case <-cs.requestTicker.C:
 			// Go fetch!
 			continue
 		}
@@ -106,8 +114,56 @@ func (cs *ControlService) Stop() {
 	}
 }
 
+func (cs *ControlService) AccelerateRequestInterval(interval, duration time.Duration) {
+	// perform a fetch now
+	if err := cs.Fetch(); err != nil {
+		// if we got an error, log it and move on
+		level.Debug(cs.logger).Log(
+			"msg", "failed to fetch data from control server. Not fatal, moving on",
+			"err", err,
+		)
+	}
+
+	if interval < cs.minAccelerationInterval {
+		level.Debug(cs.logger).Log(
+			"msg", "control service acceleration interval too small, using minimum interval",
+			"minimum_interval", cs.minAccelerationInterval,
+			"provided_interval", interval,
+		)
+		interval = cs.minAccelerationInterval
+	}
+
+	// stop existing timer
+	if cs.requestAccelerationTimer != nil {
+		cs.requestAccelerationTimer.Stop()
+	}
+
+	// set request interval back to starting interval after duration has passed
+	cs.requestAccelerationTimer = time.AfterFunc(duration, func() {
+		level.Debug(cs.logger).Log(
+			"msg", "resetting control service request interval after acceleration",
+			"interval", cs.requestInterval,
+		)
+
+		// set back to original interval
+		cs.requestTicker.Reset(cs.requestInterval)
+	})
+
+	level.Debug(cs.logger).Log(
+		"msg", "accelerating control service request interval",
+		"interval", interval,
+		"duration", duration,
+	)
+
+	// restart the ticker on accelerated interval
+	cs.requestTicker.Reset(interval)
+}
+
 // Performs a retrieval of the latest control server data, and notifies observers of updates.
 func (cs *ControlService) Fetch() error {
+	cs.fetchMutex.Lock()
+	defer cs.fetchMutex.Unlock()
+
 	// Empty hash means get the map of subsystems & hashes
 	data, err := cs.fetcher.GetConfig()
 	if err != nil {
@@ -126,10 +182,10 @@ func (cs *ControlService) Fetch() error {
 	for subsystem, hash := range subsystems {
 		logger := log.With(cs.logger, "subsystem", subsystem)
 		lastHash, ok := cs.lastFetched[subsystem]
-		if !ok && cs.getset != nil {
+		if !ok && cs.store != nil {
 			// Try to get the stored hash. If we can't get it, no worries, it means we don't have a last hash value,
 			// and we can just move on.
-			if storedHash, err := cs.getset.Get([]byte(subsystem)); err == nil {
+			if storedHash, err := cs.store.Get([]byte(subsystem)); err == nil {
 				lastHash = string(storedHash)
 			}
 		}
@@ -175,9 +231,9 @@ func (cs *ControlService) fetchAndUpdate(subsystem, hash string) error {
 	// Remember the hash of the last fetched version of this subsystem's data
 	cs.lastFetched[subsystem] = hash
 
-	if cs.getset != nil {
+	if cs.store != nil {
 		// Store the hash so we can persist the last fetched data across launcher restarts
-		err = cs.getset.Set([]byte(subsystem), []byte(hash))
+		err = cs.store.Set([]byte(subsystem), []byte(hash))
 		if err != nil {
 			level.Error(logger).Log("msg", "failed to store last fetched control data", "err", err)
 		}

@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -26,6 +25,9 @@ import (
 	desktopRunner "github.com/kolide/launcher/ee/desktop/runner"
 	"github.com/kolide/launcher/ee/localserver"
 	"github.com/kolide/launcher/pkg/agent"
+	"github.com/kolide/launcher/pkg/agent/knapsack"
+	agentbbolt "github.com/kolide/launcher/pkg/agent/storage/bbolt"
+	"github.com/kolide/launcher/pkg/autoupdate/tuf"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 	"github.com/kolide/launcher/pkg/debug"
 	"github.com/kolide/launcher/pkg/launcher"
@@ -36,6 +38,13 @@ import (
 	"github.com/oklog/run"
 
 	"go.etcd.io/bbolt"
+)
+
+const (
+	// Subsystems that launcher listens for control server updates on
+	agentFlagsSubsystemName  = "agent_flags"
+	serverDataSubsystemName  = "kolide_server_data"
+	desktopMenuSubsystemName = "kolide_desktop_menu"
 )
 
 // runLauncher is the entry point into running launcher. It creates a
@@ -98,13 +107,20 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		return fmt.Errorf("write launcher pid to file: %w", err)
 	}
 
+	stores, err := agentbbolt.MakeStores(logger, db)
+	if err != nil {
+		return fmt.Errorf("failed to create stores: %w", err)
+	}
+	k := knapsack.New(stores, db)
+
 	// If we have successfully opened the DB, and written a pid,
 	// we expect we're live. Record the version for osquery to
 	// pickup
 	internal.RecordLauncherVersion(rootDirectory)
 
 	// Try to ensure useful info in the logs
-	checkpoint.Run(logger, db, *opts)
+	checkpointer := checkpoint.New(logger, db, *opts)
+	checkpointer.Run()
 
 	// create the certificate pool
 	var rootPool *x509.CertPool
@@ -160,12 +176,12 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 	}
 
 	// init osquery instance history
-	if err := osqueryInstanceHistory.InitHistory(db); err != nil {
+	if err := osqueryInstanceHistory.InitHistory(k.OsqueryHistoryInstanceStore()); err != nil {
 		return fmt.Errorf("error initializing osquery instance history: %w", err)
 	}
 
 	// create the osquery extension for launcher. This is where osquery itself is launched.
-	extension, runnerRestart, runnerShutdown, err := createExtensionRuntime(ctx, db, client, opts)
+	extension, runnerRestart, runnerShutdown, err := createExtensionRuntime(ctx, k, client, opts)
 	if err != nil {
 		return fmt.Errorf("create extension with runtime: %w", err)
 	}
@@ -178,40 +194,60 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		"build", versionInfo.Revision,
 	)
 
+	go func() {
+		// Sleep to give osquery time to startup before the checkpointer starts using it.
+		time.Sleep(30 * time.Second)
+		checkpointer.SetQuerier(extension)
+	}()
+
+	var controlService *control.ControlService
+
 	// Create the control service and services that depend on it
 	var runner *desktopRunner.DesktopUsersProcessesRunner
 	if opts.ControlServerURL == "" {
 		level.Debug(logger).Log("msg", "control server URL not set, will not create control service")
 	} else {
-		controlService, err := createControlService(ctx, logger, db, opts)
+		controlService, err = createControlService(ctx, logger, k.ControlStore(), opts)
 		if err != nil {
 			return fmt.Errorf("failed to setup control service: %w", err)
 		}
 		runGroup.Add(controlService.ExecuteWithContext(ctx), controlService.Interrupt)
 
 		// serverDataBucketConsumer handles server data table updates
-		serverDataBucketConsumer := control.NewBucketConsumer(logger, db, osquery.ServerProvidedDataBucket)
-		controlService.RegisterConsumer("kolide_server_data", serverDataBucketConsumer)
+		controlService.RegisterConsumer(serverDataSubsystemName, k.ServerProvidedDataStore())
+		controlService.RegisterConsumer(agentFlagsSubsystemName, k.AgentFlagsStore())
 
-		desktopFlagsBucketConsumer := control.NewBucketConsumer(logger, db, "agent_flags")
-		controlService.RegisterConsumer("agent_flags", desktopFlagsBucketConsumer)
+		desktopEnabledRaw, err := k.AgentFlagsStore().Get([]byte("desktop_enabled_v1"))
+		if err != nil {
+			level.Debug(logger).Log("msg", "failed to query desktop_enabled_v1 flag", "err", err)
+		}
 
-		runner = desktopRunner.New(
+		// For now, while we're in transition from K2 to device trust, we want to default to _not_ running
+		// the desktop process. This can be overridden via control server interaction -- if the desktop_enabled_v1
+		// flag is present (regardless of it's value), this indicates control server has told launcher to enable desktop.
+		desktopProcessSpawningEnabled := desktopEnabledRaw != nil
+
+		runner, err = desktopRunner.New(
 			desktopRunner.WithLogger(logger),
 			desktopRunner.WithUpdateInterval(time.Second*5),
+			desktopRunner.WithMenuRefreshInterval(time.Minute*15),
 			desktopRunner.WithHostname(opts.KolideServerURL),
 			desktopRunner.WithAuthToken(ulid.New()),
 			desktopRunner.WithUsersFilesRoot(rootDirectory),
-			desktopRunner.WithProcessSpawningEnabled(opts.KolideServerURL == "k2device-preprod.kolide.com" || opts.KolideServerURL == "localhost:3443" || opts.KolideServerURL == "localhost:3000" || strings.HasSuffix(opts.KolideServerURL, "herokuapp.com")),
-			desktopRunner.WithGetter(desktopFlagsBucketConsumer),
+			desktopRunner.WithProcessSpawningEnabled(desktopProcessSpawningEnabled),
+			desktopRunner.WithGetter(k.AgentFlagsStore()),
 		)
+		if err != nil {
+			return fmt.Errorf("failed to create desktop runner: %w", err)
+		}
+
 		runGroup.Add(runner.Execute, runner.Interrupt)
-		controlService.RegisterConsumer("kolide_desktop_menu", runner)
-		controlService.RegisterSubscriber("agent_flags", runner)
+		controlService.RegisterConsumer(desktopMenuSubsystemName, runner)
+		controlService.RegisterSubscriber(agentFlagsSubsystemName, runner)
 
 		// Run the notification service
 		notificationConsumer, err := notificationconsumer.NewNotifyConsumer(
-			db,
+			k.SentNotificationsStore(),
 			runner,
 			ctx,
 			notificationconsumer.WithLogger(logger),
@@ -227,12 +263,20 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		}
 	}
 
-	if opts.KolideServerURL == "k2device.kolide.com" ||
-		opts.KolideServerURL == "k2device-preprod.kolide.com" ||
-		opts.KolideServerURL == "localhost:3443" ||
-		strings.HasSuffix(opts.KolideServerURL, "herokuapp.com") {
+	// runEECode feels like it should move up to the opts level.
+	// We have some stuff there that sets `controlServerURL`
+	runEECode := opts.ControlServerURL != "" || opts.IAmBreakingEELicense
 
-		ls, err := localserver.New(logger, db, opts.KolideServerURL)
+	// at this moment, these values are the same. This variable is here to help humans parse what's happening
+	runLocalServer := runEECode
+	if runLocalServer {
+		ls, err := localserver.New(
+			k.ConfigStore(),
+			opts.KolideServerURL,
+			localserver.WithLogger(logger),
+			localserver.WithControlService(controlService),
+		)
+
 		if err != nil {
 			// For now, log this and move on. It might be a fatal error
 			level.Error(logger).Log("msg", "Failed to setup localserver", "error", err)
@@ -258,11 +302,11 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		}
 
 		// create an updater for osquery
-		osqueryUpdater, err := updater.NewUpdater(ctx, opts.OsquerydPath, runnerRestart, osqueryUpdaterconfig)
+		osqueryLegacyUpdater, err := updater.NewUpdater(ctx, opts.OsquerydPath, runnerRestart, osqueryUpdaterconfig)
 		if err != nil {
 			return fmt.Errorf("create osquery updater: %w", err)
 		}
-		runGroup.Add(osqueryUpdater.Execute, osqueryUpdater.Interrupt)
+		runGroup.Add(osqueryLegacyUpdater.Execute, osqueryLegacyUpdater.Interrupt)
 
 		launcherUpdaterconfig := &updater.UpdaterConfig{
 			Logger:             logger,
@@ -282,7 +326,7 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		if err != nil {
 			logutil.Fatal(logger, "err", err)
 		}
-		launcherUpdater, err := updater.NewUpdater(
+		launcherLegacyUpdater, err := updater.NewUpdater(
 			ctx,
 			launcherPath,
 			updater.UpdateFinalizer(logger, func() error {
@@ -297,7 +341,26 @@ func runLauncher(ctx context.Context, cancel func(), opts *launcher.Options) err
 		if err != nil {
 			return fmt.Errorf("create launcher updater: %w", err)
 		}
-		runGroup.Add(launcherUpdater.Execute, launcherUpdater.Interrupt)
+		runGroup.Add(launcherLegacyUpdater.Execute, launcherLegacyUpdater.Interrupt)
+
+		// Create a new TUF autoupdater
+		metadataClient := http.DefaultClient
+		metadataClient.Timeout = 1 * time.Minute
+		tufAutoupdater, err := tuf.NewTufAutoupdater(
+			opts.TufServerURL,
+			opts.RootDirectory,
+			metadataClient,
+			k.AutoupdateErrorsStore(),
+			tuf.WithLogger(logger),
+			tuf.WithChannel(string(opts.UpdateChannel)),
+			tuf.WithUpdateCheckInterval(opts.AutoupdateInterval),
+		)
+		if err != nil {
+			// Log the error, but don't return it -- the new TUF autoupdater is not critical yet
+			level.Debug(logger).Log("msg", "could not create TUF autoupdater", "err", err)
+		} else {
+			runGroup.Add(tufAutoupdater.Execute, tufAutoupdater.Interrupt)
+		}
 	}
 
 	if err := runGroup.Run(); err != nil {

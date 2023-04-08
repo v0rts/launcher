@@ -14,6 +14,7 @@ import (
 
 	"github.com/kolide/kit/version"
 	"github.com/kolide/launcher/pkg/autoupdate"
+	"github.com/kolide/launcher/pkg/autoupdate/tuf"
 	"github.com/kolide/launcher/pkg/launcher"
 	"github.com/peterbourgon/ff/v3"
 )
@@ -74,6 +75,7 @@ func parseOptions(args []string) (*launcher.Options, error) {
 		// Autoupdate options
 		flAutoupdate             = flagset.Bool("autoupdate", false, "Whether or not the osquery autoupdater is enabled (default: false)")
 		flNotaryServerURL        = flagset.String("notary_url", autoupdate.DefaultNotary, "The Notary update server (default: https://notary.kolide.co)")
+		flTufServerURL           = flagset.String("tuf_url", tuf.DefaultTufServer, "TUF update server (default: https://tuf.kolide.com)")
 		flMirrorURL              = flagset.String("mirror_url", autoupdate.DefaultMirror, "The mirror server for autoupdates (default: https://dl.kolide.co)")
 		flAutoupdateInterval     = flagset.Duration("autoupdate_interval", 1*time.Hour, "The interval to check for updates (default: once every hour)")
 		flUpdateChannel          = flagset.String("update_channel", "stable", "The channel to pull updates from (options: stable, beta, nightly)")
@@ -81,11 +83,12 @@ func parseOptions(args []string) (*launcher.Options, error) {
 		flAutoupdateInitialDelay = flagset.Duration("autoupdater_initial_delay", 1*time.Hour, "Initial autoupdater subprocess delay")
 
 		// Development & Debugging options
-		flDebug             = flagset.Bool("debug", false, "Whether or not debug logging is enabled (default: false)")
-		flOsqueryVerbose    = flagset.Bool("osquery_verbose", false, "Enable verbose osqueryd (default: false)")
-		flDeveloperUsage    = flagset.Bool("dev_help", false, "Print full Launcher help, including developer options")
-		flInsecureTransport = flagset.Bool("insecure_transport", false, "Do not use TLS for transport layer (default: false)")
-		flInsecureTLS       = flagset.Bool("insecure", false, "Do not verify TLS certs for outgoing connections (default: false)")
+		flDebug                = flagset.Bool("debug", false, "Whether or not debug logging is enabled (default: false)")
+		flOsqueryVerbose       = flagset.Bool("osquery_verbose", false, "Enable verbose osqueryd (default: false)")
+		flDeveloperUsage       = flagset.Bool("dev_help", false, "Print full Launcher help, including developer options (default: false)")
+		flInsecureTransport    = flagset.Bool("insecure_transport", false, "Do not use TLS for transport layer (default: false)")
+		flInsecureTLS          = flagset.Bool("insecure", false, "Do not verify TLS certs for outgoing connections (default: false)")
+		flIAmBreakingEELicense = flagset.Bool("i-am-breaking-ee-license", false, "Skip license check before running localserver (default: false)")
 
 		// deprecated options, kept for any kind of config file compatibility
 		_ = flagset.String("debug_log_file", "", "DEPRECATED")
@@ -182,17 +185,23 @@ func parseOptions(args []string) (*launcher.Options, error) {
 	controlServerURL := ""
 	insecureControlTLS := false
 	disableControlTLS := false
-	if *flKolideServerURL == "k2device.kolide.com" {
+
+	switch {
+	case *flKolideServerURL == "k2device.kolide.com":
 		controlServerURL = "k2control.kolide.com"
-	} else if *flKolideServerURL == "k2device-preprod.kolide.com" {
+
+	case *flKolideServerURL == "k2device-preprod.kolide.com":
 		controlServerURL = "k2control-preprod.kolide.com"
-	} else if strings.HasSuffix(*flKolideServerURL, "herokuapp.com") {
+
+	case strings.HasSuffix(*flKolideServerURL, "herokuapp.com"):
 		controlServerURL = *flKolideServerURL
-	} else if *flKolideServerURL == "localhost:3443" {
+
+	case *flKolideServerURL == "localhost:3443":
 		controlServerURL = *flKolideServerURL
 		// We don't plumb flRootPEM through to the control server, just disable TLS for now
 		insecureControlTLS = true
-	} else if *flKolideServerURL == "localhost:3000" {
+
+	case *flKolideServerURL == "localhost:3000" || *flIAmBreakingEELicense:
 		controlServerURL = *flKolideServerURL
 		disableControlTLS = true
 	}
@@ -213,6 +222,7 @@ func parseOptions(args []string) (*launcher.Options, error) {
 		EnrollSecret:                       *flEnrollSecret,
 		EnrollSecretPath:                   *flEnrollSecretPath,
 		AutoloadedExtensions:               flAutoloadedExtensions,
+		IAmBreakingEELicense:               *flIAmBreakingEELicense,
 		InsecureTLS:                        *flInsecureTLS,
 		InsecureTransport:                  *flInsecureTransport,
 		KolideHosted:                       *flKolideHosted,
@@ -222,6 +232,7 @@ func parseOptions(args []string) (*launcher.Options, error) {
 		MirrorServerURL:                    *flMirrorURL,
 		NotaryPrefix:                       *flNotaryPrefix,
 		NotaryServerURL:                    *flNotaryServerURL,
+		TufServerURL:                       *flTufServerURL,
 		OsqueryFlags:                       flOsqueryFlags,
 		OsqueryTlsConfigEndpoint:           *flOsqTlsConfig,
 		OsqueryTlsDistributedReadEndpoint:  *flOsqTlsDistRead,

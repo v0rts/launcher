@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,13 +10,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/kolide/kit/ulid"
 	"github.com/kolide/launcher/ee/desktop/notify"
+	"github.com/kolide/launcher/pkg/threadsafebuffer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -110,9 +109,9 @@ func TestDesktopUserProcessRunner_Execute(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			var logBytes threadSafeBuffer
+			var logBytes threadsafebuffer.ThreadSafeBuffer
 
-			r := New(
+			r, err := New(
 				WithLogger(log.NewLogfmtLogger(&logBytes)),
 				WithExecutablePath(executablePath),
 				WithHostname("somewhere-over-the-rainbow.example.com"),
@@ -122,6 +121,7 @@ func TestDesktopUserProcessRunner_Execute(t *testing.T) {
 				WithUsersFilesRoot(launcherRootDir(t)),
 				WithProcessSpawningEnabled(true),
 			)
+			require.NoError(t, err)
 
 			if tt.setup != nil {
 				tt.setup(t, r)
@@ -169,30 +169,6 @@ func TestDesktopUserProcessRunner_Execute(t *testing.T) {
 			})
 		})
 	}
-}
-
-// thank you zupa https://stackoverflow.com/a/36226525
-type threadSafeBuffer struct {
-	b bytes.Buffer
-	m sync.Mutex
-}
-
-func (b *threadSafeBuffer) Read(p []byte) (n int, err error) {
-	b.m.Lock()
-	defer b.m.Unlock()
-	return b.b.Read(p)
-}
-
-func (b *threadSafeBuffer) Write(p []byte) (n int, err error) {
-	b.m.Lock()
-	defer b.m.Unlock()
-	return b.b.Write(p)
-}
-
-func (b *threadSafeBuffer) String() string {
-	b.m.Lock()
-	defer b.m.Unlock()
-	return b.b.String()
 }
 
 func launcherRootDir(t *testing.T) string {
@@ -265,7 +241,8 @@ func TestUpdate(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			r := New(WithUsersFilesRoot(dir))
+			r, err := New(WithUsersFilesRoot(dir))
+			require.NoError(t, err)
 
 			if tt.err {
 				require.Error(t, r.Update(tt.input))
@@ -290,9 +267,10 @@ func TestSendNotification_NoProcessesYet(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	r := New(WithUsersFilesRoot(dir))
+	r, err := New(WithUsersFilesRoot(dir))
+	require.NoError(t, err)
 
 	require.Equal(t, 0, len(r.uidProcs))
-	err := r.SendNotification(notify.Notification{Title: "test", Body: "test"})
+	err = r.SendNotification(notify.Notification{Title: "test", Body: "test"})
 	require.Error(t, err, "should not be able to send notification when there are no child processes")
 }
