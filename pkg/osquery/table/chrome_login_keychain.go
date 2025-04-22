@@ -4,38 +4,40 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-
 	"github.com/kolide/kit/fsutil"
-	"github.com/kolide/launcher/pkg/agent"
-	"github.com/osquery/osquery-go"
+	"github.com/kolide/launcher/ee/agent"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/tables/tablewrapper"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/osquery/osquery-go/plugin/table"
+	_ "modernc.org/sqlite"
 )
 
 // DEPRECATED use kolide_chrome_login_data_emails
-func ChromeLoginKeychainInfo(client *osquery.ExtensionManagerClient, logger log.Logger) *table.Plugin {
+func ChromeLoginKeychainInfo(flags types.Flags, slogger *slog.Logger) *table.Plugin {
 	c := &ChromeLoginKeychain{
-		client: client,
-		logger: logger,
+		slogger: slogger.With("table", "kolide_chrome_login_keychain"),
 	}
 	columns := []table.ColumnDefinition{
 		table.TextColumn("origin_url"),
 		table.TextColumn("action_url"),
 		table.TextColumn("username_value"),
 	}
-	return table.NewPlugin("kolide_chrome_login_keychain", columns, c.generate)
+	return tablewrapper.New(flags, slogger, "kolide_chrome_login_keychain", columns, c.generate)
 }
 
 type ChromeLoginKeychain struct {
-	client *osquery.ExtensionManagerClient
-	logger log.Logger
+	slogger *slog.Logger
 }
 
 func (c *ChromeLoginKeychain) generateForPath(ctx context.Context, path string) ([]map[string]string, error) {
+	_, span := traces.StartSpan(ctx, "path", path)
+	defer span.End()
+
 	dir, err := agent.MkdirTemp("kolide_chrome_login_keychain")
 	if err != nil {
 		return nil, fmt.Errorf("creating kolide_chrome_login_keychain tmp dir: %w", err)
@@ -47,7 +49,7 @@ func (c *ChromeLoginKeychain) generateForPath(ctx context.Context, path string) 
 		return nil, fmt.Errorf("copying db to tmp dir: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", dst)
+	db, err := sql.Open("sqlite", dst)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to sqlite db: %w", err)
 	}
@@ -59,7 +61,20 @@ func (c *ChromeLoginKeychain) generateForPath(ctx context.Context, path string) 
 	if err != nil {
 		return nil, fmt.Errorf("query rows from chrome login keychain db: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			c.slogger.Log(ctx, slog.LevelWarn,
+				"closing rows after scanning results",
+				"err", err,
+			)
+		}
+		if err := rows.Err(); err != nil {
+			c.slogger.Log(ctx, slog.LevelWarn,
+				"encountered iteration error",
+				"err", err,
+			)
+		}
+	}()
 
 	var results []map[string]string
 
@@ -82,7 +97,10 @@ func (c *ChromeLoginKeychain) generateForPath(ctx context.Context, path string) 
 }
 
 func (c *ChromeLoginKeychain) generate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
-	files, err := findFileInUserDirs("Library/Application Support/Google/Chrome/*/Login Data", c.logger)
+	ctx, span := traces.StartSpan(ctx, "table_name", "kolide_chrome_login_keychain")
+	defer span.End()
+
+	files, err := findFileInUserDirs("Library/Application Support/Google/Chrome/*/Login Data", c.slogger)
 	if err != nil {
 		return nil, fmt.Errorf("find chrome login data sqlite DBs: %w", err)
 	}
@@ -91,8 +109,8 @@ func (c *ChromeLoginKeychain) generate(ctx context.Context, queryContext table.Q
 	for _, file := range files {
 		res, err := c.generateForPath(ctx, file.path)
 		if err != nil {
-			level.Info(c.logger).Log(
-				"msg", "Generating chrome keychain result",
+			c.slogger.Log(ctx, slog.LevelInfo,
+				"generating chrome keychain result",
 				"path", file.path,
 				"err", err,
 			)

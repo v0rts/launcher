@@ -5,7 +5,6 @@ package execwrapper
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,7 +18,7 @@ import (
 func Exec(ctx context.Context, argv0 string, argv []string, envv []string) error {
 	logger := log.With(ctxlog.FromContext(ctx), "caller", log.DefaultCaller)
 
-	cmd := exec.CommandContext(ctx, argv0, argv[1:]...)
+	cmd := exec.CommandContext(ctx, argv0, argv[1:]...) //nolint:forbidigo // execwrapper is used exclusively to exec launcher, and we trust the autoupdate library to find the correct path.
 	cmd.Env = envv
 
 	cmd.Stdin = os.Stdin
@@ -49,7 +48,5 @@ func Exec(ctx context.Context, argv0 string, argv []string, envv []string) error
 			"err", err,
 		)
 	}
-	os.Exit(cmd.ProcessState.ExitCode())
-	return errors.New("Exec shouldn't have gotten here.")
-
+	return fmt.Errorf("exec completed with exit code %d", cmd.ProcessState.ExitCode())
 }

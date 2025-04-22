@@ -5,17 +5,18 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-
 	"github.com/kolide/kit/fsutil"
-	"github.com/kolide/launcher/pkg/agent"
-	"github.com/osquery/osquery-go"
+	"github.com/kolide/launcher/ee/agent"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/tables/tablewrapper"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/osquery/osquery-go/plugin/table"
+	_ "modernc.org/sqlite"
 )
 
 var onepasswordDataFiles = map[string][]string{
@@ -27,7 +28,7 @@ var onepasswordDataFiles = map[string][]string{
 	},
 }
 
-func OnePasswordAccounts(client *osquery.ExtensionManagerClient, logger log.Logger) *table.Plugin {
+func OnePasswordAccounts(flags types.Flags, slogger *slog.Logger) *table.Plugin {
 	columns := []table.ColumnDefinition{
 		table.TextColumn("username"),
 		table.TextColumn("user_email"),
@@ -39,21 +40,22 @@ func OnePasswordAccounts(client *osquery.ExtensionManagerClient, logger log.Logg
 	}
 
 	o := &onePasswordAccountsTable{
-		client: client,
-		logger: logger,
+		slogger: slogger.With("table", "kolide_onepassword_accounts"),
 	}
 
-	return table.NewPlugin("kolide_onepassword_accounts", columns, o.generate)
+	return tablewrapper.New(flags, slogger, "kolide_onepassword_accounts", columns, o.generate)
 }
 
 type onePasswordAccountsTable struct {
-	client *osquery.ExtensionManagerClient
-	logger log.Logger
+	slogger *slog.Logger
 }
 
 // generate the onepassword account info results given the path to a
 // onepassword sqlite DB
 func (o *onePasswordAccountsTable) generateForPath(ctx context.Context, fileInfo userFileInfo) ([]map[string]string, error) {
+	_, span := traces.StartSpan(ctx, "path", fileInfo.path)
+	defer span.End()
+
 	dir, err := agent.MkdirTemp("kolide_onepassword_accounts")
 	if err != nil {
 		return nil, fmt.Errorf("creating kolide_onepassword_accounts tmp dir: %w", err)
@@ -65,7 +67,7 @@ func (o *onePasswordAccountsTable) generateForPath(ctx context.Context, fileInfo
 		return nil, fmt.Errorf("copying sqlite db to tmp dir: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", dst)
+	db, err := sql.Open("sqlite", dst)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to sqlite db: %w", err)
 	}
@@ -75,7 +77,20 @@ func (o *onePasswordAccountsTable) generateForPath(ctx context.Context, fileInfo
 	if err != nil {
 		return nil, fmt.Errorf("query rows from onepassword account configuration db: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			o.slogger.Log(ctx, slog.LevelWarn,
+				"closing rows after scanning results",
+				"err", err,
+			)
+		}
+		if err := rows.Err(); err != nil {
+			o.slogger.Log(ctx, slog.LevelWarn,
+				"encountered iteration error",
+				"err", err,
+			)
+		}
+	}()
 
 	var results []map[string]string
 	for rows.Next() {
@@ -97,6 +112,9 @@ func (o *onePasswordAccountsTable) generateForPath(ctx context.Context, fileInfo
 }
 
 func (o *onePasswordAccountsTable) generate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
+	ctx, span := traces.StartSpan(ctx, "table_name", "kolide_onepassword_accounts")
+	defer span.End()
+
 	var results []map[string]string
 	osDataFiles, ok := onepasswordDataFiles[runtime.GOOS]
 	if !ok {
@@ -104,10 +122,10 @@ func (o *onePasswordAccountsTable) generate(ctx context.Context, queryContext ta
 	}
 
 	for _, dataFilePath := range osDataFiles {
-		files, err := findFileInUserDirs(dataFilePath, o.logger)
+		files, err := findFileInUserDirs(dataFilePath, o.slogger)
 		if err != nil {
-			level.Info(o.logger).Log(
-				"msg", "Find 1password sqlite DBs",
+			o.slogger.Log(ctx, slog.LevelInfo,
+				"find 1password sqlite DBs",
 				"path", dataFilePath,
 				"err", err,
 			)
@@ -117,8 +135,8 @@ func (o *onePasswordAccountsTable) generate(ctx context.Context, queryContext ta
 		for _, file := range files {
 			res, err := o.generateForPath(ctx, file)
 			if err != nil {
-				level.Info(o.logger).Log(
-					"msg", "Generating onepassword result",
+				o.slogger.Log(ctx, slog.LevelInfo,
+					"generating onepassword result",
 					"path", file.path,
 					"err", err,
 				)

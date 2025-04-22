@@ -9,8 +9,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/transport/http/jsonrpc"
+	"github.com/kolide/launcher/ee/agent/types"
 )
 
 // forceNoChunkedEncoding forces the connection not to use chunked
@@ -24,12 +24,11 @@ import (
 func forceNoChunkedEncoding(ctx context.Context, r *http.Request) context.Context {
 	r.TransferEncoding = []string{"identity"}
 
-	// read the body, set the content legth, and leave a new ReadCloser in Body
+	// read the body, set the content length, and leave a new ReadCloser in Body
 	bodyBuf := &bytes.Buffer{}
-	bodyReadBytes, err := io.Copy(bodyBuf, r.Body)
-	if err != nil {
-		panic(err)
-	}
+
+	// We discard the error because we can't do anything about it here -- no logger access
+	bodyReadBytes, _ := io.Copy(bodyBuf, r.Body)
 	r.Body.Close()
 	r.ContentLength = bodyReadBytes
 	r.Body = io.NopCloser(bodyBuf)
@@ -37,23 +36,29 @@ func forceNoChunkedEncoding(ctx context.Context, r *http.Request) context.Contex
 	return ctx
 }
 
+type ErrDeviceDisabled struct{}
+
+func (e ErrDeviceDisabled) Error() string {
+	return "device disabled"
+}
+
+type jsonRpcResponse struct {
+	DisableDevice bool `json:"disable_device"`
+}
+
 // New creates a new Kolide Client (implementation of the KolideService
 // interface) using a JSONRPC client connection.
 func NewJSONRPCClient(
-	serverURL string,
-	insecureTLS bool,
-	insecureTransport bool,
-	certPins [][]byte,
+	k types.Knapsack,
 	rootPool *x509.CertPool,
-	logger log.Logger,
 	options ...jsonrpc.ClientOption,
 ) KolideService {
 	serviceURL := &url.URL{
 		Scheme: "https",
-		Host:   serverURL,
+		Host:   k.KolideServerURL(),
 	}
 
-	if insecureTransport {
+	if k.InsecureTransportTLS() {
 		serviceURL.Scheme = "http"
 	}
 
@@ -63,8 +68,8 @@ func NewJSONRPCClient(
 			DisableKeepAlives: true,
 		},
 	}
-	if !insecureTransport {
-		tlsConfig := makeTLSConfig(serverURL, insecureTLS, certPins, rootPool, logger)
+	if !k.InsecureTransportTLS() {
+		tlsConfig := makeTLSConfig(k, rootPool)
 		httpClient.Transport = &http.Transport{
 			TLSClientConfig:   tlsConfig,
 			DisableKeepAlives: true,
@@ -125,7 +130,7 @@ func NewJSONRPCClient(
 		CheckHealthEndpoint:       checkHealthEndpoint,
 	}
 
-	client = LoggingMiddleware(logger)(client)
+	client = LoggingMiddleware(k)(client)
 	// Wrap with UUID middleware after logger so that UUID is available in
 	// the logger context.
 	client = uuidMiddleware(client)

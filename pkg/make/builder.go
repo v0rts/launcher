@@ -1,42 +1,32 @@
-/* Package make provides some simple functions to handle build and go
+/*
+Package make provides some simple functions to handle build and go
 dependencies.
 
 We used to do this with gnumake rules, but as we added windows
 compatibility, we found make too limiting. Moving this into go allows
 us to write cleaner cross-platform code.
 */
-
-package make
+package make //nolint:predeclared
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Masterminds/semver"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/kolide/kit/fsutil"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
-
-	"github.com/theupdateframework/notary/client"
-	"github.com/theupdateframework/notary/trustpinning"
-	"github.com/theupdateframework/notary/tuf/data"
-	"go.opencensus.io/trace"
-	"golang.org/x/sync/errgroup"
 )
 
 type Builder struct {
@@ -125,7 +115,7 @@ func New(opts ...Option) *Builder {
 		goPath: "go",
 		goVer:  strings.TrimPrefix(runtime.Version(), "go"),
 
-		execCC: exec.CommandContext,
+		execCC: exec.CommandContext, //nolint:forbidigo // Fine to use exec.CommandContext outside of launcher proper
 	}
 
 	for _, opt := range opts {
@@ -145,7 +135,7 @@ func New(opts ...Option) *Builder {
 	// that windows and cgo aren't friends. This might be wrong,
 	// but I don't want to change it yet.
 	case b.cgo && b.os == "windows":
-		panic("Windows and CGO are not friends")
+		panic("Windows and CGO are not friends") //nolint:forbidigo // Fine to use panic outside of launcher proper
 
 	// cgo is intentionally enabled
 	case b.cgo:
@@ -165,7 +155,7 @@ func New(opts ...Option) *Builder {
 			// caller here is a bunch simpler if we can
 			// return *Builder, and this error is
 			// exceedingly unlikely.
-			panic(fmt.Sprintf("Unable to get cwd: %s", err))
+			panic(fmt.Sprintf("Unable to get cwd: %s", err)) //nolint:forbidigo // Fine to use panic outside of launcher proper
 		}
 
 		cmdEnv = append(
@@ -242,9 +232,6 @@ func (b *Builder) goVersionCompatible(logger log.Logger) error {
 }
 
 func (b *Builder) DepsGo(ctx context.Context) error {
-	ctx, span := trace.StartSpan(ctx, "make.DepsGo")
-	defer span.End()
-
 	logger := ctxlog.FromContext(ctx)
 
 	level.Debug(logger).Log(
@@ -272,214 +259,9 @@ func (b *Builder) DepsGo(ctx context.Context) error {
 	return nil
 }
 
-func (b *Builder) InstallTools(ctx context.Context) error {
-	ctx, span := trace.StartSpan(ctx, "make.InstallTools")
-	defer span.End()
-
-	logger := ctxlog.FromContext(ctx)
-
-	level.Debug(logger).Log(
-		"cmd", "Install Tools",
-		"msg", "Starting",
-	)
-
-	cmd := b.execCC(
-		ctx,
-		"go", "list",
-		"-tags", "tools",
-		"-json",
-		"./pkg/tools",
-	)
-	cmd.Env = append(cmd.Env, b.cmdEnv...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("create stdout pipe for go list command: %w", err)
-	}
-	stderr := new(bytes.Buffer)
-	cmd.Stderr = stderr
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("run go list command, %s: %w", stderr, err)
-	}
-
-	var list struct {
-		Imports []string
-	}
-	if err := json.NewDecoder(stdout).Decode(&list); err != nil {
-		return fmt.Errorf("decode go list output: %w", err)
-	}
-
-	var g errgroup.Group
-	for _, toolPath := range list.Imports {
-		toolPath := toolPath
-		_, tool := path.Split(toolPath)
-		path, err := exec.LookPath(tool)
-		if err == nil {
-			level.Debug(ctxlog.FromContext(ctx)).Log(
-				"target", "install tools",
-				"tool", tool,
-				"exists", true,
-				"path", path,
-			)
-			continue
-		}
-
-		g.Go(func() error {
-			return b.installTool(ctx, toolPath)
-		})
-	}
-	err = g.Wait()
-
-	level.Debug(logger).Log(
-		"cmd", "Install Tools",
-		"msg", "Finished",
-	)
-
-	if err != nil {
-		return fmt.Errorf("install tools: %w", err)
-	}
-
-	return nil
-}
-
-func (b *Builder) installTool(ctx context.Context, importPath string) error {
-	ctx, span := trace.StartSpan(ctx, "make.installTool")
-	defer span.End()
-
-	cmd := b.execCC(ctx, "go", "install", importPath)
-	cmd.Env = append(cmd.Env, b.cmdEnv...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("run go install %s, output=%s: %w", importPath, out, err)
-	}
-	level.Debug(ctxlog.FromContext(ctx)).Log("target", "install tool", "import_path", importPath, "output", string(out))
-	return nil
-}
-
-func (b *Builder) GenerateTUF(ctx context.Context) error {
-	ctx, span := trace.StartSpan(ctx, "make.GenerateTUF")
-	defer span.End()
-
-	// First, we generate a bindata file from an empty directory so that the symbols
-	// are present (Asset, AssetDir, etc). Once the symbols are present, we can run
-	// the generate_tuf.go tool to generate actual TUF metadata. Finally, we recreate
-	// the bindata file with the real TUF metadata.
-	dir, err := os.MkdirTemp("", "bootstrap-launcher-bindata")
-	if err != nil {
-		return fmt.Errorf("create empty dir for bindata: %w", err)
-	}
-	defer os.RemoveAll(dir)
-
-	if err := b.execBindata(ctx, dir); err != nil {
-		return fmt.Errorf("exec bindata for empty dir: %w", err)
-	}
-
-	binaryTargets := []string{ // binaries that are autoupdated.
-		"osqueryd",
-		"launcher",
-	}
-
-	// previous this depended on fs.Gopath to find the templated
-	// notary files. As not everyone uses gopath, we make
-	// assuptions about how this is called to find the template dir.
-	// https://github.com/kolide/launcher/pull/503 is a better route.
-	_, myFilename, _, _ := runtime.Caller(1)
-	notaryConfigDir := filepath.Join(filepath.Dir(myFilename), "..", "..", "tools", "notary", "config")
-	notaryConfigFile, err := os.Open(filepath.Join(notaryConfigDir, "config.json"))
-	if err != nil {
-		return fmt.Errorf("opening notary config file: %w", err)
-	}
-	defer notaryConfigFile.Close()
-	var conf struct {
-		RemoteServer struct {
-			URL string `json:"url"`
-		} `json:"remote_server"`
-	}
-	if err = json.NewDecoder(notaryConfigFile).Decode(&conf); err != nil {
-		return fmt.Errorf("decoding notary config file: %w", err)
-	}
-
-	for _, t := range binaryTargets {
-		level.Debug(ctxlog.FromContext(ctx)).Log("target", "generate-tuf", "msg", "bootstrap notary", "binary", t, "remote_server_url", conf.RemoteServer.URL)
-		gun := path.Join("kolide", t)
-		localRepo := filepath.Join("pkg", "autoupdate", "assets", fmt.Sprintf("%s-tuf", t))
-		if err := os.MkdirAll(localRepo, 0755); err != nil {
-			return fmt.Errorf("make autoupdate dir %s: %w", localRepo, err)
-		}
-
-		if err := bootstrapFromNotary(notaryConfigDir, conf.RemoteServer.URL, localRepo, gun); err != nil {
-			return fmt.Errorf("bootstrap notary GUN %s: %w", gun, err)
-		}
-	}
-
-	if err := b.execBindata(ctx, "pkg/autoupdate/assets/..."); err != nil {
-		return fmt.Errorf("exec bindata for autoupdate assets: %w", err)
-	}
-
-	return nil
-}
-
-func (b *Builder) execBindata(ctx context.Context, dir string) error {
-	ctx, span := trace.StartSpan(ctx, "make.execBindata")
-	defer span.End()
-
-	cmd := b.execCC(
-		ctx,
-		"go-bindata",
-		"-o", "pkg/autoupdate/bindata.go",
-		"-pkg", "autoupdate",
-		dir,
-	)
-	// 	cmd.Env = append(cmd.Env, b.cmdEnv...)
-	out, err := cmd.CombinedOutput()
-
-	if err != nil {
-		return fmt.Errorf("run bindata for dir %s, output=%s: %w", dir, out, err)
-	}
-
-	return nil
-}
-
-func bootstrapFromNotary(notaryConfigDir, remoteServerURL, localRepo, gun string) error {
-	passwordRetrieverFn := func(key, alias string, createNew bool, attempts int) (pass string, giveUp bool, err error) {
-		pass = os.Getenv(key)
-		if pass == "" {
-			err = fmt.Errorf("Missing pass phrase env var %q", key)
-		}
-		return pass, giveUp, err
-	}
-
-	// Safely fetch and validate all TUF metadata from remote Notary server.
-	repo, err := client.NewFileCachedRepository(
-		notaryConfigDir,
-		data.GUN(gun),
-		remoteServerURL,
-		&http.Transport{Proxy: http.ProxyFromEnvironment},
-		passwordRetrieverFn,
-		trustpinning.TrustPinConfig{},
-	)
-	if err != nil {
-		return fmt.Errorf("create an instance of the TUF repository: %w", err)
-	}
-
-	if _, err := repo.GetAllTargetMetadataByName(""); err != nil {
-		return fmt.Errorf("getting all target metadata: %w", err)
-	}
-
-	// Stage TUF metadata and create bindata from it so it can be distributed as part of the Launcher executable
-	source := filepath.Join(notaryConfigDir, "tuf", gun, "metadata")
-	if err := fsutil.CopyDir(source, localRepo); err != nil {
-		return fmt.Errorf("copying TUF repo metadata: %w", err)
-	}
-
-	return nil
-}
-
 func (b *Builder) BuildCmd(src, appName string) func(context.Context) error {
 	return func(ctx context.Context) error {
 		output := b.PlatformBinaryName(appName)
-
-		ctx, span := trace.StartSpan(ctx, fmt.Sprintf("make.BuildCmd.%s", appName))
-		defer span.End()
 
 		logger := ctxlog.FromContext(ctx)
 
@@ -503,6 +285,9 @@ func (b *Builder) BuildCmd(src, appName string) func(context.Context) error {
 		var ldFlags []string
 		if b.static {
 			ldFlags = append(ldFlags, "-d -linkmode internal")
+		} else if b.os == "linux" && b.arch != runtime.GOARCH {
+			// Cross-compiling for Linux requires external linking
+			ldFlags = append(ldFlags, "-linkmode external")
 		}
 
 		if !b.notStripped {
@@ -512,6 +297,12 @@ func (b *Builder) BuildCmd(src, appName string) func(context.Context) error {
 		if b.os == "windows" {
 			// this prevents a cmd prompt opening up when desktop is launched
 			ldFlags = append(ldFlags, "-H windowsgui")
+		}
+
+		if b.os == "darwin" {
+			// Suppress warnings like "ld: warning: ignoring duplicate libraries: '-lobjc'"
+			// See: https://github.com/golang/go/issues/67799
+			ldFlags = append(ldFlags, "-extldflags=-Wl,-no_warn_duplicate_libraries")
 		}
 
 		if b.stampVersion {
@@ -548,9 +339,6 @@ func (b *Builder) BuildCmd(src, appName string) func(context.Context) error {
 			ldFlags = append(ldFlags, fmt.Sprintf(`-X "github.com/kolide/kit/version.goVersion=%s"`, runtime.Version()))
 		}
 
-		// Set the build time for autoupdate.FindNewest
-		ldFlags = append(ldFlags, fmt.Sprintf(`-X "github.com/kolide/launcher/pkg/autoupdate.defaultBuildTimestamp=%s"`, strconv.FormatInt(time.Now().Unix(), 10)))
-
 		if len(ldFlags) != 0 {
 			baseArgs = append(baseArgs, fmt.Sprintf("--ldflags=%s", strings.Join(ldFlags, " ")))
 		}
@@ -559,7 +347,12 @@ func (b *Builder) BuildCmd(src, appName string) func(context.Context) error {
 		cmd := b.execCC(ctx, b.goPath, args...)
 		cmd.Env = append(cmd.Env, b.cmdEnv...)
 		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+
+		// Some build commands, especially relating to link errors on macOS, are emitted to STDERR and do not change
+		// exit code. To compensate, we can capture stderr, and if present, declare the run a failure. This was prompted
+		// by https://github.com/kolide/launcher/issues/1276
+		var stderr bytes.Buffer
+		cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
 
 		level.Debug(ctxlog.FromContext(ctx)).Log(
 			"mgs", "building binary",
@@ -573,6 +366,23 @@ func (b *Builder) BuildCmd(src, appName string) func(context.Context) error {
 			return err
 		}
 
+		// With the Sonoma-era Xcode binaries, we've started seeing a bunch of spurious warnings. They appear to
+		// _mostly_ effect our developer build process. In the interest in not breaking the build, we ignore them.
+		// https://github.com/golang/go/issues/62597#issuecomment-1733893918 is some of them, and some seem related to
+		// the zig cross compiling
+		stderrStr := stderr.String()
+		if os.Getenv("GITHUB_ACTIONS") == "" {
+			stderrStr = strings.ReplaceAll(stderrStr, "ld: warning: ignoring duplicate libraries: '-lobjc'\n", "")
+			stderrStr = strings.ReplaceAll(stderrStr, fmt.Sprintf("# github.com/kolide/launcher/cmd/%s\n", filepath.Base(src)), "")
+
+			re := regexp.MustCompile(`ld: warning: object file \(.*\) was built for newer 'macOS' version \(.+\) than being linked \(.+\)\n`)
+			stderrStr = re.ReplaceAllString(stderrStr, "")
+		}
+
+		if len(stderrStr) > 0 {
+			return errors.New("stderr not empty")
+		}
+
 		// Tell github where we're at
 		if b.githubActionOutput {
 			outputFilePath := os.Getenv("GITHUB_OUTPUT")
@@ -582,7 +392,15 @@ func (b *Builder) BuildCmd(src, appName string) func(context.Context) error {
 				return fmt.Errorf("failed to open $GITHUB_OUTPUT file: %w", err)
 			}
 
-			defer f.Close()
+			defer func() {
+				if err := f.Close(); err != nil {
+					level.Error(ctxlog.FromContext(ctx)).Log(
+						"mgs", "Got Error writing GITHUB_OUTPUT",
+						"app_name", appName,
+						"err", err,
+					)
+				}
+			}()
 
 			if _, err = f.WriteString(fmt.Sprintf("binary=%s\n", output)); err != nil {
 				return fmt.Errorf("failed to write to $GITHUB_OUTPUT file: %w", err)
@@ -631,11 +449,11 @@ func (b *Builder) getVersion(ctx context.Context) (string, error) {
 	matches := versionRegex.FindAllStringSubmatch(gitVersion, -1)
 
 	if len(matches) == 0 {
-		return "", fmt.Errorf(`Version "%s" did not match expected format. Expect major.minor[.patch][-additional]`, gitVersion)
+		return "", fmt.Errorf(`version "%s" did not match expected format: expected major.minor[.patch][-additional]`, gitVersion)
 	}
 
 	if len(matches[0]) != 5 {
-		return "", fmt.Errorf("Something very wrong. Expected 5 subgroups got %d from string %s", len(matches), gitVersion)
+		return "", fmt.Errorf("something very wrong: expected 5 subgroups, got %d, from string %s", len(matches), gitVersion)
 	}
 
 	major := matches[0][1]

@@ -3,11 +3,9 @@ package packagekit
 import (
 	"context"
 	"fmt"
-	"html/template"
 	"io"
 	"strings"
-
-	"go.opencensus.io/trace"
+	"text/template"
 )
 
 type systemdOptions struct {
@@ -16,9 +14,6 @@ type systemdOptions struct {
 }
 
 func RenderSystemd(ctx context.Context, w io.Writer, initOptions *InitOptions) error {
-	_, span := trace.StartSpan(ctx, "packagekit.Systemd")
-	defer span.End()
-
 	sOpts := &systemdOptions{
 		Restart:    "on-failure",
 		RestartSec: 3,

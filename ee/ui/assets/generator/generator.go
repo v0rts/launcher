@@ -44,7 +44,7 @@ func main() {
 	)
 	if err := flagset.Parse(os.Args[1:]); err != nil {
 		level.Error(logger).Log("msg", "error parsing flags", "err", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher proper
 	}
 
 	// relevel with the debug flag
@@ -61,7 +61,7 @@ func main() {
 		}
 	}
 	if missingOpt {
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher proper
 	}
 
 	inDir = *flIndir
@@ -72,7 +72,7 @@ func main() {
 	files, err := filepath.Glob(inDir + "/*.png")
 	if err != nil {
 		level.Error(logger).Log("msg", "error globbing input files", "error", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher proper
 	}
 	for _, file := range files {
 		file = filepath.Base(file)
@@ -82,20 +82,20 @@ func main() {
 
 	if dir, err := os.MkdirTemp("", "icon-generator"); err != nil {
 		level.Error(logger).Log("msg", "error making tmpdir", "err", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher proper
 	} else {
 		tmpDir = dir
 	}
 
 	ctx := context.Background()
 
-	for name, _ := range iconNames {
+	for name := range iconNames {
 		if err := generateIco(ctx, logger, name); err != nil {
 			level.Error(logger).Log(
 				"msg", "error generating ico",
 				"name", name,
 				"err", err)
-			os.Exit(1)
+			os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher proper
 		}
 
 		if err := generatePng(ctx, logger, name); err != nil {
@@ -103,13 +103,13 @@ func main() {
 				"msg", "error generating png",
 				"name", name,
 				"err", err)
-			os.Exit(1)
+			os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher proper
 		}
 	}
 
 	if err := generateAssetGo(ctx, logger); err != nil {
 		level.Error(logger).Log("msg", "error expanding template", "error", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher proper
 	}
 
 }
@@ -152,7 +152,7 @@ func generatePng(ctx context.Context, logger log.Logger, name string) error {
 	}
 
 	// Scaling these doesn't seem to be a win for space or resolution. So leave them as is
-	cmd := exec.CommandContext(ctx, "cp", input, output)
+	cmd := exec.CommandContext(ctx, "cp", input, output) //nolint:forbidigo // Fine to use exec.CommandContext since it's not in launcher proper
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
@@ -178,7 +178,7 @@ func generateIco(ctx context.Context, logger log.Logger, name string) error {
 
 	// First, we need to generate all the sizes
 	for _, size := range icoSizes {
-		cmd := exec.CommandContext(
+		cmd := exec.CommandContext( //nolint:forbidigo // Fine to use exec.CommandContext since it's not in launcher proper
 			ctx,
 			"convert",
 			"-resize", fmt.Sprintf("%sx%s", size, size),
@@ -192,7 +192,7 @@ func generateIco(ctx context.Context, logger log.Logger, name string) error {
 	}
 
 	// Now that we have the intermediary sizes, we can stich them into a single ico
-	cmd := exec.CommandContext(ctx, "convert", fmt.Sprintf("%s/%s-*.ico", tmpDir, name), output)
+	cmd := exec.CommandContext(ctx, "convert", fmt.Sprintf("%s/%s-*.ico", tmpDir, name), output) //nolint:forbidigo // Fine to use exec.CommandContext since it's not in launcher proper
 	level.Debug(logger).Log("msg", "Consolodating ico with", "cmd", cmd.String())
 
 	if err := cmd.Run(); err != nil {

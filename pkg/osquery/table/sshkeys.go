@@ -6,14 +6,14 @@ package table
 
 import (
 	"context"
+	"log/slog"
 	"runtime"
 	"strconv"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-
-	"github.com/kolide/launcher/pkg/keyidentifier"
-	"github.com/osquery/osquery-go"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/keyidentifier"
+	"github.com/kolide/launcher/ee/tables/tablewrapper"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
@@ -24,13 +24,12 @@ var sshDirs = map[string][]string{
 var sshDirsDefault = []string{".ssh/*"}
 
 type SshKeysTable struct {
-	client     *osquery.ExtensionManagerClient
-	logger     log.Logger
+	slogger    *slog.Logger
 	kIdentifer *keyidentifier.KeyIdentifier
 }
 
 // New returns a new table extension
-func SshKeys(client *osquery.ExtensionManagerClient, logger log.Logger) *table.Plugin {
+func SshKeys(flags types.Flags, slogger *slog.Logger) *table.Plugin {
 	columns := []table.ColumnDefinition{
 		table.TextColumn("user"),
 		table.TextColumn("path"),
@@ -41,26 +40,28 @@ func SshKeys(client *osquery.ExtensionManagerClient, logger log.Logger) *table.P
 		table.TextColumn("fingerprint_md5"),
 	}
 
-	// we don't want the logging in osquery, so don't instantiate WithLogger()
+	// we don't want the logging in osquery, so don't instantiate WithSlogger()
 	kIdentifer, err := keyidentifier.New()
 	if err != nil {
-		level.Info(logger).Log(
-			"msg", "Failed to create keyidentifier",
+		slogger.Log(context.TODO(), slog.LevelInfo,
+			"failed to create keyidentifier",
 			"err", err,
 		)
 		return nil
 	}
 
 	t := &SshKeysTable{
-		client:     client,
-		logger:     logger,
+		slogger:    slogger.With("table", "kolide_ssh_keys"),
 		kIdentifer: kIdentifer,
 	}
 
-	return table.NewPlugin("kolide_ssh_keys", columns, t.generate)
+	return tablewrapper.New(flags, slogger, "kolide_ssh_keys", columns, t.generate)
 }
 
 func (t *SshKeysTable) generate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
+	ctx, span := traces.StartSpan(ctx, "table_name", "kolide_ssh_keys")
+	defer span.End()
+
 	var results []map[string]string
 
 	// Find the dirs we're going to search
@@ -70,10 +71,10 @@ func (t *SshKeysTable) generate(ctx context.Context, queryContext table.QueryCon
 	}
 
 	for _, dir := range dirs {
-		files, err := findFileInUserDirs(dir, t.logger)
+		files, err := findFileInUserDirs(dir, t.slogger)
 		if err != nil {
-			level.Info(t.logger).Log(
-				"msg", "Error finding ssh keys paths",
+			t.slogger.Log(ctx, slog.LevelInfo,
+				"error finding ssh keys paths",
 				"path", dir,
 				"err", err,
 			)
@@ -83,8 +84,8 @@ func (t *SshKeysTable) generate(ctx context.Context, queryContext table.QueryCon
 		for _, file := range files {
 			ki, err := t.kIdentifer.IdentifyFile(file.path)
 			if err != nil {
-				level.Debug(t.logger).Log(
-					"msg", "Failed to get keyinfo for file",
+				t.slogger.Log(ctx, slog.LevelInfo,
+					"failed to get keyinfo for file",
 					"file", file.path,
 					"err", err,
 				)

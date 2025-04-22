@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-	osquery "github.com/osquery/osquery-go"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/tables/tablewrapper"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
@@ -23,10 +24,9 @@ var chromeLocalStateDirs = map[string][]string{
 // try the list of known linux paths if runtime.GOOS doesn't match 'darwin' or 'windows'
 var chromeLocalStateDirDefault = []string{".config/google-chrome", ".config/chromium", "snap/chromium/current/.config/chromium"}
 
-func ChromeUserProfiles(client *osquery.ExtensionManagerClient, logger log.Logger) *table.Plugin {
+func ChromeUserProfiles(flags types.Flags, slogger *slog.Logger) *table.Plugin {
 	c := &chromeUserProfilesTable{
-		client: client,
-		logger: logger,
+		slogger: slogger.With("table", "kolide_chrome_user_profiles"),
 	}
 
 	columns := []table.ColumnDefinition{
@@ -36,12 +36,11 @@ func ChromeUserProfiles(client *osquery.ExtensionManagerClient, logger log.Logge
 		table.IntegerColumn("ephemeral"),
 	}
 
-	return table.NewPlugin("kolide_chrome_user_profiles", columns, c.generate)
+	return tablewrapper.New(flags, slogger, "kolide_chrome_user_profiles", columns, c.generate)
 }
 
 type chromeUserProfilesTable struct {
-	client *osquery.ExtensionManagerClient
-	logger log.Logger
+	slogger *slog.Logger
 }
 
 type chromeLocalState struct {
@@ -57,6 +56,9 @@ type chromeProfileInfo struct {
 }
 
 func (c *chromeUserProfilesTable) generateForPath(ctx context.Context, fileInfo userFileInfo) ([]map[string]string, error) {
+	_, span := traces.StartSpan(ctx, "path", fileInfo.path)
+	defer span.End()
+
 	var results []map[string]string
 	data, err := os.ReadFile(fileInfo.path)
 	if err != nil {
@@ -80,6 +82,9 @@ func (c *chromeUserProfilesTable) generateForPath(ctx context.Context, fileInfo 
 }
 
 func (c *chromeUserProfilesTable) generate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
+	ctx, span := traces.StartSpan(ctx, "table_name", "kolide_chrome_user_profiles")
+	defer span.End()
+
 	osChromeLocalStateDirs, ok := chromeLocalStateDirs[runtime.GOOS]
 	if !ok {
 		osChromeLocalStateDirs = chromeLocalStateDirDefault
@@ -87,10 +92,10 @@ func (c *chromeUserProfilesTable) generate(ctx context.Context, queryContext tab
 
 	var results []map[string]string
 	for _, localStateFilePath := range osChromeLocalStateDirs {
-		userFiles, err := findFileInUserDirs(filepath.Join(localStateFilePath, "Local State"), c.logger)
+		userFiles, err := findFileInUserDirs(filepath.Join(localStateFilePath, "Local State"), c.slogger)
 		if err != nil {
-			level.Info(c.logger).Log(
-				"msg", "Finding chrome local state file",
+			c.slogger.Log(ctx, slog.LevelInfo,
+				"finding chrome local state file",
 				"path", localStateFilePath,
 				"err", err,
 			)
@@ -99,8 +104,8 @@ func (c *chromeUserProfilesTable) generate(ctx context.Context, queryContext tab
 		for _, file := range userFiles {
 			res, err := c.generateForPath(ctx, file)
 			if err != nil {
-				level.Info(c.logger).Log(
-					"msg", "Generating user profile result",
+				c.slogger.Log(ctx, slog.LevelInfo,
+					"generating user profile result",
 					"path", file.path,
 					"err", err,
 				)

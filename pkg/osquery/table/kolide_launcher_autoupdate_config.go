@@ -2,24 +2,26 @@ package table
 
 import (
 	"context"
+	"log/slog"
 
-	"github.com/kolide/launcher/pkg/launcher"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/tables/tablewrapper"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
 const launcherAutoupdateConfigTableName = "kolide_launcher_autoupdate_config"
 
-func LauncherAutoupdateConfigTable(opts *launcher.Options) *table.Plugin {
+func LauncherAutoupdateConfigTable(slogger *slog.Logger, flags types.Flags) *table.Plugin {
 	columns := []table.ColumnDefinition{
 		table.TextColumn("autoupdate"),
-		table.TextColumn("notary_server_url"),
 		table.TextColumn("mirror_server_url"),
 		table.TextColumn("tuf_server_url"),
 		table.TextColumn("autoupdate_interval"),
 		table.TextColumn("update_channel"),
 	}
 
-	return table.NewPlugin(launcherAutoupdateConfigTableName, columns, generateLauncherAutoupdateConfigTable(opts))
+	return tablewrapper.New(flags, slogger, launcherAutoupdateConfigTableName, columns, generateLauncherAutoupdateConfigTable(flags))
 }
 
 func boolToString(in bool) string {
@@ -30,16 +32,18 @@ func boolToString(in bool) string {
 	}
 }
 
-func generateLauncherAutoupdateConfigTable(opts *launcher.Options) table.GenerateFunc {
+func generateLauncherAutoupdateConfigTable(flags types.Flags) table.GenerateFunc {
 	return func(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
+		_, span := traces.StartSpan(ctx, "table_name", launcherAutoupdateConfigTableName)
+		defer span.End()
+
 		return []map[string]string{
 			{
-				"autoupdate":          boolToString(opts.Autoupdate),
-				"notary_server_url":   opts.NotaryServerURL,
-				"mirror_server_url":   opts.MirrorServerURL,
-				"tuf_server_url":      opts.TufServerURL,
-				"autoupdate_interval": opts.AutoupdateInterval.String(),
-				"update_channel":      string(opts.UpdateChannel),
+				"autoupdate":          boolToString(flags.Autoupdate()),
+				"mirror_server_url":   flags.MirrorServerURL(),
+				"tuf_server_url":      flags.TufServerURL(),
+				"autoupdate_interval": flags.AutoupdateInterval().String(),
+				"update_channel":      flags.UpdateChannel(),
 			},
 		}, nil
 	}

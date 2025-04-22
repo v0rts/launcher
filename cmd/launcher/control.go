@@ -3,26 +3,29 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/kolide/launcher/ee/agent/types"
 	"github.com/kolide/launcher/ee/control"
-	"github.com/kolide/launcher/pkg/agent/types"
-	"github.com/kolide/launcher/pkg/launcher"
+	"github.com/kolide/launcher/pkg/traces"
 )
 
-func createHTTPClient(ctx context.Context, logger log.Logger, opts *launcher.Options) (*control.HTTPClient, error) {
-	level.Debug(logger).Log("msg", "creating control http client")
+func createHTTPClient(ctx context.Context, k types.Knapsack) (*control.HTTPClient, error) {
+	k.Slogger().Log(ctx, slog.LevelDebug,
+		"creating control http client",
+	)
 
 	clientOpts := []control.HTTPClientOption{}
-	if opts.InsecureControlTLS {
+	if k.InsecureControlTLS() {
 		clientOpts = append(clientOpts, control.WithInsecureSkipVerify())
 	}
-	if opts.DisableControlTLS {
+	if k.DisableControlTLS() {
 		clientOpts = append(clientOpts, control.WithDisableTLS())
 	}
-	client, err := control.NewControlHTTPClient(logger, opts.ControlServerURL, http.DefaultClient, clientOpts...)
+
+	logger := k.Slogger().With("component", "control_http_client")
+	client, err := control.NewControlHTTPClient(k.ControlServerURL(), http.DefaultClient, logger, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating control http client: %w", err)
 	}
@@ -30,19 +33,23 @@ func createHTTPClient(ctx context.Context, logger log.Logger, opts *launcher.Opt
 	return client, nil
 }
 
-func createControlService(ctx context.Context, logger log.Logger, store types.GetterSetter, opts *launcher.Options) (*control.ControlService, error) {
-	level.Debug(logger).Log("msg", "creating control service")
+func createControlService(ctx context.Context, k types.Knapsack) (*control.ControlService, error) {
+	ctx, span := traces.StartSpan(ctx)
+	defer span.End()
 
-	client, err := createHTTPClient(ctx, logger, opts)
+	k.Slogger().Log(ctx, slog.LevelDebug,
+		"creating control service",
+	)
+
+	client, err := createHTTPClient(ctx, k)
 	if err != nil {
 		return nil, err
 	}
 
 	controlOpts := []control.Option{
-		control.WithRequestInterval(opts.ControlRequestInterval),
-		control.WithStore(store),
+		control.WithStore(k.ControlStore()),
 	}
-	service := control.New(logger, client, controlOpts...)
+	service := control.New(k, client, controlOpts...)
 
 	return service, nil
 }

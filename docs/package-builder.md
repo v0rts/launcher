@@ -58,10 +58,10 @@ ls build/windows/package-builder.exe
 ## General Usage
 
 `package-builder` will fetch binaries from either local disk, or
-Kolide's Notary server. These are specified with version command line
+Kolide's TUF server. These are specified with version command line
 options. Arguments that look like a path (denoted by starting with `/`
 or `./`) will be pulled from local disk, otherwise the argument is
-parsed as a notary channel.
+parsed as a TUF channel.
 
 The only required parameter is `--hostname`.
 
@@ -73,7 +73,7 @@ it via another mechanism), you can use the `--omit_secret` flag.
 
 ### Simplest Package Creation
 
-The simplest usage, is to use the binaries on the Kolide Notary
+The simplest usage, is to use the binaries on the Kolide TUF
 server:
 
 ``` shell
@@ -152,7 +152,7 @@ use the `--identifier` flag to specify this value.
 #### Cross Platform Binaries and Targets
 
 `package-builder` can package cross platform. If you're obtaining
-binaries from notary, this should be straight forward, and you can
+binaries from TUF, this should be straight forward, and you can
 specify multiple targets in a single invocation.  However, if you're
 using locally build binaries you will need to run `package-builder`
 for each target platform.
@@ -193,3 +193,27 @@ Note that the windows package will only install as `ALLUSERS`. You may
 need to use elevated privileges to install it. This will likely be
 confusing. `msiexec.exe` will either silently fail, or be
 inscrutable. But `start` will work.
+
+###### Windows Multi-Archecture MSI
+
+Package builder creates an MSI containing both amd64 & arm64 binaries. This is done putting both of binaries and their service installation in to the MSI with mutually exclusive conditions based on processor architecture.
+
+To accomplish we are using heat to harvest files set up like ...
+
+```
+└───pkg_root
+    └───Launcher-kolide-k2
+        ├───bin
+        │   ├───amd64
+        │   │       launcher.exe
+        │   │       osqueryd.exe
+        │   │
+        │   └───arm64
+        │           launcher.exe
+        │           osqueryd.exe
+        │
+        └───conf
+                ...
+```
+
+then post processing the generated xml to remove the amd64 and arm64 directory tags so that all the exe files are in the same directory in the xml, then add the mutually exclusive tags to the binary elements

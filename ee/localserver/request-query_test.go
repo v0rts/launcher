@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	typesMocks "github.com/kolide/launcher/ee/agent/types/mocks"
 	"github.com/kolide/launcher/ee/localserver/mocks"
+	"github.com/kolide/launcher/pkg/log/multislogger"
 	"github.com/osquery/osquery-go/plugin/distributed"
 	"github.com/stretchr/testify/require"
 )
@@ -50,6 +52,11 @@ func Test_localServer_requestQueryHandler(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
+			mockKnapsack := typesMocks.NewKnapsack(t)
+			mockKnapsack.On("KolideServerURL").Return("localhost")
+			mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
+			mockKnapsack.On("ReadEnrollSecret").Return("enroll_secret", nil)
+
 			//go:generate mockery --name Querier
 			// https://github.com/vektra/mockery <-- cli tool to generate mocks for usage with testify
 			mockQuerier := mocks.NewQuerier(t)
@@ -58,14 +65,14 @@ func Test_localServer_requestQueryHandler(t *testing.T) {
 				mockQuerier.On("Query", tt.query).Return(tt.mockQueryResult, nil).Once()
 			}
 
-			var logBytes bytes.Buffer
-			server := testServer(t, &logBytes)
+			server := testServer(t, mockKnapsack)
 			server.querier = mockQuerier
 
 			jsonBytes, err := json.Marshal(map[string]string{
 				"query": tt.query,
 			})
-			req, err := http.NewRequest("", "", bytes.NewBuffer(jsonBytes))
+			require.NoError(t, err)
+			req, err := http.NewRequest("", "", bytes.NewBuffer(jsonBytes)) //nolint:noctx // Don't care about this in tests
 			require.NoError(t, err)
 
 			queryParams := req.URL.Query()
@@ -211,6 +218,11 @@ func Test_localServer_requestRunScheduledQueryHandler(t *testing.T) {
 		t.Run(tt.testName, func(t *testing.T) {
 			t.Parallel()
 
+			mockKnapsack := typesMocks.NewKnapsack(t)
+			mockKnapsack.On("KolideServerURL").Return("localhost")
+			mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
+			mockKnapsack.On("ReadEnrollSecret").Return("enroll_secret", nil)
+
 			// set up mock querier
 			mockQuerier := mocks.NewQuerier(t)
 			scheduledQueryQuery := fmt.Sprintf("select name, query from osquery_schedule where name like '%s'", tt.scheduledQueriesQueryNamePattern)
@@ -224,8 +236,7 @@ func Test_localServer_requestRunScheduledQueryHandler(t *testing.T) {
 			}
 
 			// set up test server
-			var logBytes bytes.Buffer
-			server := testServer(t, &logBytes)
+			server := testServer(t, mockKnapsack)
 			server.querier = mockQuerier
 
 			// make request body
@@ -235,7 +246,7 @@ func Test_localServer_requestRunScheduledQueryHandler(t *testing.T) {
 			require.NoError(t, err)
 
 			// set up request
-			req, err := http.NewRequest("", "", bytes.NewBuffer(jsonBytes))
+			req, err := http.NewRequest("", "", bytes.NewBuffer(jsonBytes)) //nolint:noctx // Don't care about this in tests
 			require.NoError(t, err)
 
 			// set up handler
@@ -251,7 +262,6 @@ func Test_localServer_requestRunScheduledQueryHandler(t *testing.T) {
 			}
 
 			require.Equal(t, mustMarshal(t, tt.expectedResult), rr.Body.Bytes())
-			return
 		})
 	}
 }

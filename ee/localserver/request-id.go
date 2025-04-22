@@ -1,34 +1,40 @@
 package localserver
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
-	"os/user"
-	"runtime"
 	"time"
 
-	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/kit/ulid"
-	"github.com/kolide/launcher/ee/consoleuser"
-	"github.com/kolide/launcher/pkg/backoff"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/pkg/traces"
 )
 
-type identifiers struct {
-	UUID           string
-	InstanceId     string
-	HardwareSerial string
-}
+type (
+	identifiers struct {
+		UUID           string
+		InstanceId     string
+		HardwareSerial string
+	}
 
-type requestIdsResponse struct {
-	RequestId string
-	identifiers
-	Nonce        string
-	Timestamp    time.Time
-	ConsoleUsers []*user.User
-}
+	requestIdsResponse struct {
+		RequestId string
+		identifiers
+		Nonce             string
+		Timestamp         time.Time
+		Status            status
+		Origin            string
+		EnrollmentDetails types.EnrollmentDetails
+	}
+
+	status struct {
+		EnrollmentStatus string
+		InstanceStatuses map[string]types.InstanceStatus
+	}
+)
 
 const (
 	idSQL = "select instance_id, osquery_info.uuid, hardware_serial from osquery_info, system_info"
@@ -67,60 +73,34 @@ func (ls *localServer) requestIdHandler() http.Handler {
 	return http.HandlerFunc(ls.requestIdHandlerFunc)
 }
 
-func (ls *localServer) requestIdHandlerFunc(res http.ResponseWriter, req *http.Request) {
+func (ls *localServer) requestIdHandlerFunc(w http.ResponseWriter, r *http.Request) {
+	r, span := traces.StartHttpRequestSpan(r, "path", r.URL.Path)
+	defer span.End()
+
+	enrollmentStatus, _ := ls.knapsack.CurrentEnrollmentStatus()
+	enrollmentDetails := ls.knapsack.GetEnrollmentDetails()
+
 	response := requestIdsResponse{
 		Nonce:     ulid.New(),
 		Timestamp: time.Now(),
+		Origin:    r.Header.Get("Origin"),
+		Status: status{
+			EnrollmentStatus: string(enrollmentStatus),
+		},
+		EnrollmentDetails: enrollmentDetails,
 	}
 	response.identifiers = ls.identifiers
 
-	consoleUsers, err := consoleUsers()
-	if err != nil {
-		level.Error(ls.logger).Log(
-			"msg", "getting console users",
-			"err", err,
-		)
-		response.ConsoleUsers = []*user.User{}
-	} else {
-		response.ConsoleUsers = consoleUsers
-	}
-
 	jsonBytes, err := json.Marshal(response)
 	if err != nil {
-		level.Info(ls.logger).Log("msg", "unable to marshal json", "err", err)
+		traces.SetError(span, err)
+		ls.slogger.Log(r.Context(), slog.LevelError,
+			"marshaling json",
+			"err", err,
+		)
+
 		jsonBytes = []byte(fmt.Sprintf("unable to marshal json: %v", err))
 	}
 
-	res.Write(jsonBytes)
-}
-
-func consoleUsers() ([]*user.User, error) {
-	const maxDuration = 1 * time.Second
-	context, cancel := context.WithTimeout(context.Background(), maxDuration)
-	defer cancel()
-
-	var users []*user.User
-
-	return users, backoff.WaitFor(func() error {
-		uids, err := consoleuser.CurrentUids(context)
-		if err != nil {
-			return err
-		}
-
-		for _, uid := range uids {
-			var err error
-			var u *user.User
-			if runtime.GOOS == "windows" {
-				u, err = user.Lookup(uid)
-			} else {
-				u, err = user.LookupId(uid)
-			}
-			if err != nil {
-				return err
-			}
-
-			users = append(users, u)
-		}
-		return nil
-	}, maxDuration, 250*time.Millisecond)
+	w.Write(jsonBytes)
 }

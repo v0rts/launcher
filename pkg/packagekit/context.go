@@ -32,7 +32,7 @@ func InitContext(ctx context.Context) context.Context {
 	return ctx
 }
 
-func setInContext(ctx context.Context, key contextKey, val string) {
+func SetInContext(ctx context.Context, key contextKey, val string) {
 	// If there's no pointer, then there's no point in setting
 	// this. It won't get back to the caller.
 	ptr, ok := ctx.Value(key).(*string)
@@ -45,7 +45,7 @@ func setInContext(ctx context.Context, key contextKey, val string) {
 func GetFromContext(ctx context.Context, key contextKey) (string, error) {
 	ptr, ok := ctx.Value(key).(*string)
 	if !ok {
-		return "", errors.New("Context didn't have a string pointer")
+		return "", errors.New("context didn't have a string pointer")
 	}
 	return *ptr, nil
 }

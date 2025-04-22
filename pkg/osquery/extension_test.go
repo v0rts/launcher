@@ -7,25 +7,33 @@ package osquery
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"sync"
 	"testing"
 	"testing/quick"
 	"time"
 
-	"github.com/go-kit/kit/log"
 	"github.com/kolide/kit/testutil"
-	"github.com/kolide/launcher/pkg/agent/knapsack"
-	"github.com/kolide/launcher/pkg/agent/storage"
-	agentbbolt "github.com/kolide/launcher/pkg/agent/storage/bbolt"
+	"github.com/kolide/kit/ulid"
+	"github.com/kolide/launcher/ee/agent/storage"
+	agentbbolt "github.com/kolide/launcher/ee/agent/storage/bbolt"
+	storageci "github.com/kolide/launcher/ee/agent/storage/ci"
+	"github.com/kolide/launcher/ee/agent/storage/inmemory"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/agent/types/mocks"
+	"github.com/kolide/launcher/pkg/log/multislogger"
+	settingsstoremock "github.com/kolide/launcher/pkg/osquery/mocks"
+	"github.com/kolide/launcher/pkg/osquery/runtime/history"
 	"github.com/kolide/launcher/pkg/service"
 	"github.com/kolide/launcher/pkg/service/mock"
-	"github.com/mixer/clock"
 	"github.com/osquery/osquery-go/plugin/distributed"
 	"github.com/osquery/osquery-go/plugin/logger"
 	"github.com/stretchr/testify/assert"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/bbolt"
 )
@@ -47,21 +55,40 @@ func makeTempDB(t *testing.T) (db *bbolt.DB, cleanup func()) {
 	}
 }
 
-func makeKnapsack(t *testing.T, db *bbolt.DB) *knapsack.Knapsack {
-	stores, err := agentbbolt.MakeStores(log.NewNopLogger(), db)
-	if err != nil {
-		t.Fatalf("creating stores: %s", err.Error())
-	}
-	k := knapsack.New(stores, db)
-
-	return k
+func makeKnapsack(t *testing.T, db *bbolt.DB) types.Knapsack {
+	m := mocks.NewKnapsack(t)
+	m.On("OsquerydPath").Maybe().Return("")
+	m.On("LatestOsquerydPath", testifymock.Anything).Maybe().Return("")
+	m.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	m.On("Slogger").Return(multislogger.NewNopLogger())
+	m.On("ReadEnrollSecret").Maybe().Return("enroll_secret", nil)
+	m.On("RootDirectory").Maybe().Return("whatever")
+	m.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	m.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	m.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+	store := inmemory.NewStore()
+	osqHistory, err := history.InitHistory(store)
+	require.NoError(t, err)
+	m.On("OsqueryHistory").Return(osqHistory).Maybe()
+	m.On("GetEnrollmentDetails").Return(types.EnrollmentDetails{OSVersion: "1", Hostname: "test"}, nil).Maybe()
+	return m
 }
 
 func TestNewExtensionEmptyEnrollSecret(t *testing.T) {
+	m := mocks.NewKnapsack(t)
+	m.On("OsquerydPath").Maybe().Return("")
+	m.On("LatestOsquerydPath", testifymock.Anything).Maybe().Return("")
+	m.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	m.On("Slogger").Return(multislogger.NewNopLogger())
+	m.On("ReadEnrollSecret").Maybe().Return("", errors.New("test"))
+	m.On("GetEnrollmentDetails").Return(types.EnrollmentDetails{OSVersion: "1", Hostname: "test"}, nil).Maybe()
+	m.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	m.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
 
-	e, err := NewExtension(&mock.KolideService{}, nil, ExtensionOpts{})
-	assert.NotNil(t, err)
-	assert.Nil(t, e)
+	// We should be able to make an extension despite an empty enroll secret
+	e, err := NewExtension(context.TODO(), &mock.KolideService{}, settingsstoremock.NewSettingsStoreWriter(t), m, ulid.New(), ExtensionOpts{})
+	assert.Nil(t, err)
+	assert.NotNil(t, e)
 }
 
 func TestNewExtensionDatabaseError(t *testing.T) {
@@ -72,7 +99,6 @@ func TestNewExtensionDatabaseError(t *testing.T) {
 	}
 
 	db, _ := makeTempDB(t)
-	k := makeKnapsack(t, db)
 	path := db.Path()
 	db.Close()
 
@@ -86,17 +112,23 @@ func TestNewExtensionDatabaseError(t *testing.T) {
 		os.Remove(file.Name())
 	}()
 
-	e, err := NewExtension(&mock.KolideService{}, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	m := mocks.NewKnapsack(t)
+	m.On("ConfigStore").Return(agentbbolt.NewStore(context.TODO(), multislogger.NewNopLogger(), db, storage.ConfigStore.String()))
+	m.On("Slogger").Return(multislogger.NewNopLogger()).Maybe()
+	m.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	m.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), &mock.KolideService{}, settingsstoremock.NewSettingsStoreWriter(t), m, ulid.New(), ExtensionOpts{})
 	assert.NotNil(t, err)
 	assert.Nil(t, e)
 }
 
 func TestGetHostIdentifier(t *testing.T) {
-
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
+
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(&mock.KolideService{}, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), &mock.KolideService{}, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	ident, err := e.getHostIdentifier()
@@ -111,7 +143,7 @@ func TestGetHostIdentifier(t *testing.T) {
 	db, cleanup = makeTempDB(t)
 	defer cleanup()
 	k = makeKnapsack(t, db)
-	e, err = NewExtension(&mock.KolideService{}, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err = NewExtension(context.TODO(), &mock.KolideService{}, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	ident, err = e.getHostIdentifier()
@@ -126,14 +158,11 @@ func TestGetHostIdentifierCorruptedData(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(&mock.KolideService{}, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), &mock.KolideService{}, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	// Put garbage UUID in DB
-	err = db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(storage.ConfigStore.String()))
-		return b.Put([]byte(uuidKey), []byte("garbage_uuid"))
-	})
+	err = k.ConfigStore().Set([]byte(uuidKey), []byte("garbage_uuid"))
 	require.Nil(t, err)
 
 	ident, err := e.getHostIdentifier()
@@ -153,35 +182,19 @@ func TestExtensionEnrollTransportError(t *testing.T) {
 			return "", false, errors.New("transport")
 		},
 	}
+
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, types.DefaultRegistrationID, ExtensionOpts{})
 	require.Nil(t, err)
-	e.SetQuerier(mockClient{})
 
 	key, invalid, err := e.Enroll(context.Background())
 	assert.True(t, m.RequestEnrollmentFuncInvoked)
 	assert.Equal(t, "", key)
 	assert.True(t, invalid)
 	assert.NotNil(t, err)
-}
-
-type mockClient struct{}
-
-func (mockClient) Query(sql string) ([]map[string]string, error) {
-	return []map[string]string{
-		{
-			"os_version":       "",
-			"launcher_version": "",
-			"os_build":         "",
-			"platform":         "",
-			"hostname":         "",
-			"hardware_vendor":  "",
-			"hardware_model":   "",
-			"osquery_version":  "",
-		},
-	}, nil
 }
 
 func TestExtensionEnrollSecretInvalid(t *testing.T) {
@@ -194,9 +207,8 @@ func TestExtensionEnrollSecretInvalid(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	k := makeKnapsack(t, db)
 	defer cleanup()
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
-	e.SetQuerier(mockClient{})
 
 	key, invalid, err := e.Enroll(context.Background())
 	assert.True(t, m.RequestEnrollmentFuncInvoked)
@@ -215,13 +227,22 @@ func TestExtensionEnroll(t *testing.T) {
 			return expectedNodeKey, false, nil
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
+	s := settingsstoremock.NewSettingsStoreWriter(t)
+
+	k := mocks.NewKnapsack(t)
+	k.On("OsquerydPath").Maybe().Return("")
+	k.On("LatestOsquerydPath", testifymock.Anything).Maybe().Return("")
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("Slogger").Return(multislogger.NewNopLogger())
 	expectedEnrollSecret := "foo_secret"
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: expectedEnrollSecret})
+	k.On("ReadEnrollSecret").Maybe().Return(expectedEnrollSecret, nil)
+	k.On("GetEnrollmentDetails").Return(types.EnrollmentDetails{OSVersion: "1", Hostname: "test"}, nil).Maybe()
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), m, s, k, types.DefaultRegistrationID, ExtensionOpts{})
 	require.Nil(t, err)
-	e.SetQuerier(mockClient{})
 
 	key, invalid, err := e.Enroll(context.Background())
 	require.Nil(t, err)
@@ -239,9 +260,8 @@ func TestExtensionEnroll(t *testing.T) {
 	assert.Equal(t, expectedNodeKey, key)
 	assert.Equal(t, expectedEnrollSecret, gotEnrollSecret)
 
-	e, err = NewExtension(m, k, ExtensionOpts{EnrollSecret: expectedEnrollSecret})
+	e, err = NewExtension(context.TODO(), m, s, k, types.DefaultRegistrationID, ExtensionOpts{})
 	require.Nil(t, err)
-	e.SetQuerier(mockClient{})
 	// Still should not re-enroll (because node key stored in DB)
 	key, invalid, err = e.Enroll(context.Background())
 	require.Nil(t, err)
@@ -273,7 +293,8 @@ func TestExtensionGenerateConfigsTransportError(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	k.ConfigStore().Set([]byte(nodeKeyKey), []byte("some_node_key"))
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, types.DefaultRegistrationID, ExtensionOpts{})
 	require.Nil(t, err)
 
 	configs, err := e.GenerateConfigs(context.Background())
@@ -285,7 +306,7 @@ func TestExtensionGenerateConfigsTransportError(t *testing.T) {
 
 func TestExtensionGenerateConfigsCaching(t *testing.T) {
 
-	configVal := `{"foo": "bar"}`
+	configVal := `{"foo":"bar","options":{"distributed_interval":5,"verbose":true}}`
 	m := &mock.KolideService{
 		RequestConfigFunc: func(ctx context.Context, nodeKey string) (string, bool, error) {
 			return configVal, false, nil
@@ -294,7 +315,9 @@ func TestExtensionGenerateConfigsCaching(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	s := settingsstoremock.NewSettingsStoreWriter(t)
+	s.On("WriteSettings").Return(nil)
+	e, err := NewExtension(context.TODO(), m, s, k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	configs, err := e.GenerateConfigs(context.Background())
@@ -331,10 +354,9 @@ func TestExtensionGenerateConfigsEnrollmentInvalid(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 	e.NodeKey = "bad_node_key"
-	e.SetQuerier(mockClient{})
 
 	configs, err := e.GenerateConfigs(context.Background())
 	assert.True(t, m.RequestConfigFuncInvoked)
@@ -344,9 +366,45 @@ func TestExtensionGenerateConfigsEnrollmentInvalid(t *testing.T) {
 	assert.Equal(t, expectedNodeKey, gotNodeKey)
 }
 
+func TestGenerateConfigs_CannotEnrollYet(t *testing.T) {
+	s := &mock.KolideService{
+		RequestConfigFunc: func(ctx context.Context, nodeKey string) (string, bool, error) {
+			// Returns node_invalid
+			return "", true, nil
+		},
+	}
+
+	k := mocks.NewKnapsack(t)
+	k.On("OsquerydPath").Maybe().Return("")
+	k.On("LatestOsquerydPath", testifymock.Anything).Maybe().Return("")
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("Slogger").Return(multislogger.NewNopLogger())
+	k.On("ReadEnrollSecret").Maybe().Return("", errors.New("test"))
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), s, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
+	require.Nil(t, err)
+
+	configs, err := e.GenerateConfigs(context.Background())
+	assert.NotNil(t, configs)
+	assert.Equal(t, map[string]string{"config": "{}"}, configs)
+	assert.Nil(t, err)
+
+	// Should have tried to request config
+	assert.True(t, s.RequestConfigFuncInvoked)
+
+	// On node invalid response, should attempt to retrieve enroll secret
+	k.AssertExpectations(t)
+
+	// Since we can't retrieve the enroll secret, we shouldn't attempt to enroll yet
+	assert.False(t, s.RequestEnrollmentFuncInvoked)
+}
+
 func TestExtensionGenerateConfigs(t *testing.T) {
 
-	configVal := `{"foo": "bar"}`
+	configVal := `{"foo":"bar","options":{"distributed_interval":5,"verbose":true}}`
 	m := &mock.KolideService{
 		RequestConfigFunc: func(ctx context.Context, nodeKey string) (string, bool, error) {
 			return configVal, false, nil
@@ -355,7 +413,9 @@ func TestExtensionGenerateConfigs(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	s := settingsstoremock.NewSettingsStoreWriter(t)
+	s.On("WriteSettings").Return(nil)
+	e, err := NewExtension(context.TODO(), m, s, k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	configs, err := e.GenerateConfigs(context.Background())
@@ -374,7 +434,7 @@ func TestExtensionWriteLogsTransportError(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	err = e.writeLogsWithReenroll(context.Background(), logger.LogTypeSnapshot, []string{"foobar"}, true)
@@ -398,10 +458,9 @@ func TestExtensionWriteLogsEnrollmentInvalid(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 	e.NodeKey = "bad_node_key"
-	e.SetQuerier(mockClient{})
 
 	err = e.writeLogsWithReenroll(context.Background(), logger.LogTypeString, []string{"foobar"}, true)
 	assert.True(t, m.PublishLogsFuncInvoked)
@@ -428,7 +487,7 @@ func TestExtensionWriteLogs(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 	e.NodeKey = expectedNodeKey
 
@@ -492,10 +551,21 @@ func TestExtensionWriteBufferedLogsEmpty(t *testing.T) {
 			return "", "", false, nil
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+
+	// Create the status logs bucket ahead of time
+	statusLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.StatusLogsStore.String())
+	require.NoError(t, err)
+
+	k := mocks.NewKnapsack(t)
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("Slogger").Return(multislogger.NewNopLogger()).Maybe()
+	k.On("StatusLogsStore").Return(statusLogsStore)
+	k.On("ReadEnrollSecret").Maybe().Return("enroll_secret", nil)
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	// No buffered logs should result in success and no remote action being
@@ -515,16 +585,32 @@ func TestExtensionWriteBufferedLogs(t *testing.T) {
 				gotStatusLogs = logs
 			case logger.LogTypeString:
 				gotResultLogs = logs
+			case logger.LogTypeSnapshot, logger.LogTypeHealth, logger.LogTypeInit:
+				t.Errorf("unexpected log type %v", logType)
 			default:
 				t.Error("Unknown log type")
 			}
 			return "", "", false, nil
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+
+	// Create these buckets ahead of time
+	statusLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.StatusLogsStore.String())
+	require.NoError(t, err)
+	resultLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.ResultLogsStore.String())
+	require.NoError(t, err)
+
+	k := mocks.NewKnapsack(t)
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("Slogger").Return(multislogger.NewNopLogger()).Maybe()
+	k.On("StatusLogsStore").Return(statusLogsStore)
+	k.On("ResultLogsStore").Return(resultLogsStore)
+	k.On("ReadEnrollSecret").Maybe().Return("enroll_secret", nil)
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	e.LogString(context.Background(), logger.LogTypeStatus, "status foo")
@@ -580,18 +666,31 @@ func TestExtensionWriteBufferedLogsEnrollmentInvalid(t *testing.T) {
 			return expectedNodeKey, false, nil
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+
+	// Create the status logs bucket ahead of time
+	statusLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.StatusLogsStore.String())
+	require.NoError(t, err)
+
+	k := mocks.NewKnapsack(t)
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("StatusLogsStore").Return(statusLogsStore)
+	k.On("OsquerydPath").Maybe().Return("")
+	k.On("LatestOsquerydPath", testifymock.Anything).Maybe().Return("")
+	k.On("Slogger").Return(multislogger.NewNopLogger())
+	k.On("ReadEnrollSecret").Maybe().Return("enroll_secret", nil)
+	k.On("GetEnrollmentDetails").Return(types.EnrollmentDetails{OSVersion: "1", Hostname: "test"}, nil).Maybe()
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
-	e.SetQuerier(mockClient{})
 
 	e.LogString(context.Background(), logger.LogTypeStatus, "status foo")
 	e.LogString(context.Background(), logger.LogTypeStatus, "status bar")
 
 	// long timeout is due to github actions runners IO slowness
-	testutil.FatalAfterFunc(t, 4*time.Second, func() {
+	testutil.FatalAfterFunc(t, 7*time.Second, func() {
 		err = e.writeBufferedLogsForType(logger.LogTypeStatus)
 	})
 	assert.Nil(t, err)
@@ -610,17 +709,31 @@ func TestExtensionWriteBufferedLogsLimit(t *testing.T) {
 				gotStatusLogs = logs
 			case logger.LogTypeString:
 				gotResultLogs = logs
+			case logger.LogTypeSnapshot, logger.LogTypeHealth, logger.LogTypeInit:
+				t.Errorf("unexpected log type %v", logType)
 			default:
 				t.Error("Unknown log type")
 			}
 			return "", "", false, nil
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{
-		EnrollSecret:     "enroll_secret",
+
+	// Create the status logs bucket ahead of time
+	statusLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.StatusLogsStore.String())
+	require.NoError(t, err)
+	resultLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.ResultLogsStore.String())
+	require.NoError(t, err)
+
+	k := mocks.NewKnapsack(t)
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("Slogger").Return(multislogger.NewNopLogger())
+	k.On("StatusLogsStore").Return(statusLogsStore)
+	k.On("ResultLogsStore").Return(resultLogsStore)
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{
 		MaxBytesPerBatch: 100,
 	})
 	require.Nil(t, err)
@@ -675,22 +788,32 @@ func TestExtensionWriteBufferedLogsDropsBigLog(t *testing.T) {
 				gotStatusLogs = logs
 			case logger.LogTypeString:
 				gotResultLogs = logs
+			case logger.LogTypeSnapshot, logger.LogTypeHealth, logger.LogTypeInit:
+				t.Errorf("unexpected log type %v", logType)
 			default:
 				t.Error("Unknown log type")
 			}
 			return "", "", false, nil
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{
-		EnrollSecret:     "enroll_secret",
+
+	resultLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.ResultLogsStore.String())
+	require.NoError(t, err)
+
+	k := mocks.NewKnapsack(t)
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("Slogger").Return(multislogger.NewNopLogger())
+	k.On("ResultLogsStore").Return(resultLogsStore)
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{
 		MaxBytesPerBatch: 15,
 	})
 	require.Nil(t, err)
 
-	startLogCount, err := e.numberOfBufferedLogs(logger.LogTypeString)
+	startLogCount, err := e.knapsack.ResultLogsStore().Count()
 	require.NoError(t, err)
 	require.Equal(t, 0, startLogCount, "start with no buffered logs")
 
@@ -704,7 +827,7 @@ func TestExtensionWriteBufferedLogsDropsBigLog(t *testing.T) {
 	e.LogString(context.Background(), logger.LogTypeString, "res4")
 	e.LogString(context.Background(), logger.LogTypeString, "this_result_is_tooooooo_big! darn")
 
-	queuedLogCount, err := e.numberOfBufferedLogs(logger.LogTypeString)
+	queuedLogCount, err := e.knapsack.ResultLogsStore().Count()
 	require.NoError(t, err)
 	require.Equal(t, 8, queuedLogCount, "correct number of enqueued logs")
 
@@ -729,41 +852,54 @@ func TestExtensionWriteBufferedLogsDropsBigLog(t *testing.T) {
 	assert.Nil(t, gotResultLogs)
 	assert.Nil(t, gotStatusLogs)
 
-	finalLogCount, err := e.numberOfBufferedLogs(logger.LogTypeString)
+	finalLogCount, err := e.knapsack.ResultLogsStore().Count()
 	require.NoError(t, err)
 	require.Equal(t, 0, finalLogCount, "no more queued logs")
 }
 
 func TestExtensionWriteLogsLoop(t *testing.T) {
 	var gotStatusLogs, gotResultLogs []string
-	var funcInvokedStatus, funcInvokedResult bool
+	var logLock sync.Mutex
 	var done = make(chan struct{})
 	m := &mock.KolideService{
 		PublishLogsFunc: func(ctx context.Context, nodeKey string, logType logger.LogType, logs []string) (string, string, bool, error) {
 			defer func() { done <- struct{}{} }()
 
+			logLock.Lock()
+			defer logLock.Unlock()
+
 			switch logType {
 			case logger.LogTypeStatus:
-				funcInvokedStatus = true
 				gotStatusLogs = logs
 			case logger.LogTypeString:
-				funcInvokedResult = true
 				gotResultLogs = logs
+			case logger.LogTypeSnapshot, logger.LogTypeHealth, logger.LogTypeInit:
+				t.Errorf("unexpected log type %v", logType)
 			default:
 				t.Error("Unknown log type")
 			}
 			return "", "", false, nil
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	mockClock := clock.NewMockClock()
-	expectedLoggingInterval := 10 * time.Second
-	e, err := NewExtension(m, k, ExtensionOpts{
-		EnrollSecret:     "enroll_secret",
+
+	// Create the status logs bucket ahead of time
+	statusLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.StatusLogsStore.String())
+	require.NoError(t, err)
+	resultLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.ResultLogsStore.String())
+	require.NoError(t, err)
+
+	k := mocks.NewKnapsack(t)
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("Slogger").Return(multislogger.NewNopLogger())
+	k.On("StatusLogsStore").Return(statusLogsStore)
+	k.On("ResultLogsStore").Return(resultLogsStore)
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	expectedLoggingInterval := 5 * time.Second
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{
 		MaxBytesPerBatch: 200,
-		Clock:            mockClock,
 		LoggingInterval:  expectedLoggingInterval,
 	})
 	require.Nil(t, err)
@@ -781,55 +917,77 @@ func TestExtensionWriteLogsLoop(t *testing.T) {
 	}
 
 	// Should write first 10 logs
-	e.Start()
+	go e.Execute()
 	testutil.FatalAfterFunc(t, 1*time.Second, func() {
 		// PublishLogsFunc runs twice for each run of the loop
 		<-done
 		<-done
 	})
-	assert.True(t, funcInvokedStatus)
-	assert.True(t, funcInvokedResult)
-	assert.Nil(t, err)
+	// Examine the logs, then reset them for the next test
+	logLock.Lock()
 	assert.Equal(t, expectedStatusLogs[:10], gotStatusLogs)
 	assert.Equal(t, expectedResultLogs[:10], gotResultLogs)
-
-	funcInvokedStatus = false
-	funcInvokedResult = false
 	gotStatusLogs = nil
 	gotResultLogs = nil
+	logLock.Unlock()
 
 	// Should write last 10 logs
-	mockClock.AddTime(expectedLoggingInterval + 1)
+	time.Sleep(expectedLoggingInterval + 1*time.Second)
 	testutil.FatalAfterFunc(t, 1*time.Second, func() {
 		// PublishLogsFunc runs twice of each run of the loop
 		<-done
 		<-done
 	})
-	assert.True(t, funcInvokedStatus)
-	assert.True(t, funcInvokedResult)
-	assert.Nil(t, err)
+	// Examine the logs, then reset them for the next test
+	logLock.Lock()
 	assert.Equal(t, expectedStatusLogs[10:], gotStatusLogs)
 	assert.Equal(t, expectedResultLogs[10:], gotResultLogs)
-
-	funcInvokedStatus = false
-	funcInvokedResult = false
 	gotStatusLogs = nil
 	gotResultLogs = nil
+	logLock.Unlock()
 
 	// No more logs to write
-	mockClock.AddTime(expectedLoggingInterval + 1)
+	time.Sleep(expectedLoggingInterval + 1*time.Second)
 	// Block to ensure publish function could be called if the logic is
 	// incorrect
 	time.Sleep(1 * time.Millisecond)
-	assert.False(t, funcInvokedStatus)
-	assert.False(t, funcInvokedResult)
-	assert.Nil(t, err)
+	// Confirm logs are nil because nothing got published
+	logLock.Lock()
 	assert.Nil(t, gotStatusLogs)
 	assert.Nil(t, gotResultLogs)
+	logLock.Unlock()
 
 	testutil.FatalAfterFunc(t, 3*time.Second, func() {
-		e.Shutdown()
+		e.Shutdown(errors.New("test error"))
 	})
+
+	// Confirm we can call Shutdown multiple times without blocking
+	interruptComplete := make(chan struct{})
+	expectedInterrupts := 3
+	for i := 0; i < expectedInterrupts; i += 1 {
+		go func() {
+			e.Shutdown(errors.New("test error"))
+			interruptComplete <- struct{}{}
+		}()
+	}
+
+	receivedInterrupts := 0
+	for {
+		if receivedInterrupts >= expectedInterrupts {
+			break
+		}
+
+		select {
+		case <-interruptComplete:
+			receivedInterrupts += 1
+			continue
+		case <-time.After(5 * time.Second):
+			t.Errorf("could not call interrupt multiple times and return within 5 seconds -- received %d interrupts before timeout", receivedInterrupts)
+			t.FailNow()
+		}
+	}
+
+	require.Equal(t, expectedInterrupts, receivedInterrupts)
 }
 
 func TestExtensionPurgeBufferedLogs(t *testing.T) {
@@ -842,6 +1000,8 @@ func TestExtensionPurgeBufferedLogs(t *testing.T) {
 				gotStatusLogs = logs
 			case logger.LogTypeString:
 				gotResultLogs = logs
+			case logger.LogTypeSnapshot, logger.LogTypeHealth, logger.LogTypeInit:
+				t.Errorf("unexpected log type %v", logType)
 			default:
 				t.Error("Unknown log type")
 			}
@@ -849,11 +1009,26 @@ func TestExtensionPurgeBufferedLogs(t *testing.T) {
 			return "", "", false, errors.New("server rejected logs")
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	max := 10
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret", MaxBufferedLogs: max})
+
+	// Create these buckets ahead of time
+	statusLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.StatusLogsStore.String())
+	require.NoError(t, err)
+	resultLogsStore, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.ResultLogsStore.String())
+	require.NoError(t, err)
+
+	k := mocks.NewKnapsack(t)
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("StatusLogsStore").Return(statusLogsStore)
+	k.On("ResultLogsStore").Return(resultLogsStore)
+	k.On("Slogger").Return(multislogger.NewNopLogger())
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	maximum := 10
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{
+		MaxBufferedLogs: maximum,
+	})
 	require.Nil(t, err)
 
 	var expectedStatusLogs, expectedResultLogs []string
@@ -870,12 +1045,12 @@ func TestExtensionPurgeBufferedLogs(t *testing.T) {
 
 		e.writeAndPurgeLogs()
 
-		if i < max {
+		if i < maximum {
 			assert.Equal(t, expectedStatusLogs, gotStatusLogs)
 			assert.Equal(t, expectedResultLogs, gotResultLogs)
 		} else {
-			assert.Equal(t, expectedStatusLogs[i-max:], gotStatusLogs)
-			assert.Equal(t, expectedResultLogs[i-max:], gotResultLogs)
+			assert.Equal(t, expectedStatusLogs[i-maximum:], gotStatusLogs)
+			assert.Equal(t, expectedResultLogs[i-maximum:], gotResultLogs)
 		}
 	}
 }
@@ -890,7 +1065,7 @@ func TestExtensionGetQueriesTransportError(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	queries, err := e.GetQueries(context.Background())
@@ -912,13 +1087,21 @@ func TestExtensionGetQueriesEnrollmentInvalid(t *testing.T) {
 			return expectedNodeKey, false, nil
 		},
 	}
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+
+	k := mocks.NewKnapsack(t)
+	k.On("ConfigStore").Return(storageci.NewStore(t, multislogger.NewNopLogger(), storage.ConfigStore.String()))
+	k.On("OsquerydPath").Maybe().Return("")
+	k.On("LatestOsquerydPath", testifymock.Anything).Maybe().Return("")
+	k.On("Slogger").Return(multislogger.NewNopLogger())
+	k.On("ReadEnrollSecret").Return("enroll_secret", nil)
+	k.On("GetEnrollmentDetails").Return(types.EnrollmentDetails{OSVersion: "1", Hostname: "test"}, nil).Maybe()
+	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
+	k.On("RegisterChangeObserver", testifymock.Anything, testifymock.Anything).Maybe().Return()
+	k.On("DeregisterChangeObserver", testifymock.Anything).Maybe().Return()
+
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 	e.NodeKey = "bad_node_key"
-	e.SetQuerier(mockClient{})
 
 	queries, err := e.GetQueries(context.Background())
 	assert.True(t, m.RequestQueriesFuncInvoked)
@@ -944,13 +1127,106 @@ func TestExtensionGetQueries(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	queries, err := e.GetQueries(context.Background())
 	assert.True(t, m.RequestQueriesFuncInvoked)
 	require.Nil(t, err)
 	assert.Equal(t, expectedQueries, queries.Queries)
+}
+
+func TestGetQueries_Forwarding(t *testing.T) {
+	expectedQueries := map[string]string{
+		"time":    "select * from time",
+		"version": "select version from osquery_info",
+	}
+	m := &mock.KolideService{
+		RequestQueriesFunc: func(ctx context.Context, nodeKey string) (*distributed.GetQueriesResult, bool, error) {
+			return &distributed.GetQueriesResult{
+				Queries: expectedQueries,
+			}, false, nil
+		},
+	}
+	db, cleanup := makeTempDB(t)
+	defer cleanup()
+	k := makeKnapsack(t, db)
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
+	require.Nil(t, err)
+
+	// Shorten our accelerated startup period so we aren't waiting for a full two minutes for the test
+	acceleratedStartupPeriod := 10 * time.Second
+	e.forwardAllDistributedUntil.Store(time.Now().Unix() + int64(acceleratedStartupPeriod.Seconds()))
+
+	// Shorten the forwarding interval for the same reason
+	e.distributedForwardingInterval.Store(5)
+
+	// Request queries -- this first time, since we're requesting queries right after startup,
+	// the request should go through.
+	queries, err := e.GetQueries(context.TODO())
+	assert.True(t, m.RequestQueriesFuncInvoked)
+	require.Nil(t, err)
+	assert.Equal(t, expectedQueries, queries.Queries)
+
+	// Now, wait for the startup period to pass
+	time.Sleep(acceleratedStartupPeriod)
+
+	// Request queries -- this time, the request should go through because we haven't made a request
+	// within the last `e.distributedForwardingInterval` seconds.
+	queries, err = e.GetQueries(context.TODO())
+	require.Nil(t, err)
+	require.Equal(t, expectedQueries, queries.Queries)
+
+	// Immediately request queries again. This time, the request should NOT go through, because
+	// we made a request within the last `e.distributedForwardingInterval` seconds.
+	// We should get back an empty response.
+	queries, err = e.GetQueries(context.TODO())
+	require.Nil(t, err)
+	require.Nil(t, queries.Queries)
+}
+
+func TestGetQueries_Forwarding_RespondsToAccelerationRequest(t *testing.T) {
+	expectedQueries := map[string]string{
+		"time":    "select * from time",
+		"version": "select version from osquery_info",
+	}
+	m := &mock.KolideService{
+		RequestQueriesFunc: func(ctx context.Context, nodeKey string) (*distributed.GetQueriesResult, bool, error) {
+			return &distributed.GetQueriesResult{
+				Queries:           expectedQueries,
+				AccelerateSeconds: 30, // set AccelerateSeconds to make sure the extension responds accordingly
+			}, false, nil
+		},
+	}
+	db, cleanup := makeTempDB(t)
+	defer cleanup()
+	k := makeKnapsack(t, db)
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
+	require.Nil(t, err)
+
+	// Shorten our accelerated startup period so we aren't waiting for a full two minutes to start the test
+	e.forwardAllDistributedUntil.Store(0)
+
+	// Request queries -- this first time, since we're requesting queries right after startup,
+	// the request should go through.
+	queries, err := e.GetQueries(context.TODO())
+	assert.True(t, m.RequestQueriesFuncInvoked)
+	require.Nil(t, err)
+	assert.Equal(t, expectedQueries, queries.Queries)
+
+	// We should have responded to the `AccelerateSeconds` set by the response.
+	// Confirm that we set `e.forwardAllDistributedUntil` to accelerate requests.
+	require.Greater(t, e.forwardAllDistributedUntil.Load(), int64(0))
+
+	// Request queries twice more -- this will be before e.distributedForwardingInterval seconds have passed,
+	// but we should be in accelerated mode and should therefore see the request go through to the cloud.
+	queries, err = e.GetQueries(context.TODO())
+	require.Nil(t, err)
+	require.Equal(t, expectedQueries, queries.Queries)
+
+	queries, err = e.GetQueries(context.TODO())
+	require.Nil(t, err)
+	require.Equal(t, expectedQueries, queries.Queries)
 }
 
 func TestExtensionWriteResultsTransportError(t *testing.T) {
@@ -963,7 +1239,7 @@ func TestExtensionWriteResultsTransportError(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	err = e.WriteResults(context.Background(), []distributed.Result{})
@@ -987,10 +1263,9 @@ func TestExtensionWriteResultsEnrollmentInvalid(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 	e.NodeKey = "bad_node_key"
-	e.SetQuerier(mockClient{})
 
 	err = e.WriteResults(context.Background(), []distributed.Result{})
 	assert.True(t, m.PublishResultsFuncInvoked)
@@ -1011,7 +1286,7 @@ func TestExtensionWriteResults(t *testing.T) {
 	db, cleanup := makeTempDB(t)
 	defer cleanup()
 	k := makeKnapsack(t, db)
-	e, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	e, err := NewExtension(context.TODO(), m, settingsstoremock.NewSettingsStoreWriter(t), k, ulid.New(), ExtensionOpts{})
 	require.Nil(t, err)
 
 	expectedResults := []distributed.Result{
@@ -1028,30 +1303,251 @@ func TestExtensionWriteResults(t *testing.T) {
 	assert.Equal(t, expectedResults, gotResults)
 }
 
-func TestLauncherRsaKeys(t *testing.T) {
-	m := &mock.KolideService{}
+func Test_setOsqueryOptions(t *testing.T) {
+	t.Parallel()
 
-	db, cleanup := makeTempDB(t)
-	defer cleanup()
-	k := makeKnapsack(t, db)
-	_, err := NewExtension(m, k, ExtensionOpts{EnrollSecret: "enroll_secret"})
+	type testCase struct {
+		name           string
+		initialConfig  map[string]any
+		overrideOpts   map[string]any
+		expectedConfig map[string]any
+	}
+
+	testCases := []testCase{
+		{
+			name:          "empty config, startup override opts",
+			initialConfig: make(map[string]any),
+			overrideOpts:  startupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"verbose":              true,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+			},
+		},
+		{
+			name:          "empty config, post-startup override opts",
+			initialConfig: make(map[string]any),
+			overrideOpts:  postStartupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"verbose":              false,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+			},
+		},
+		{
+			name: "config with verbose already set, startup override opts",
+			initialConfig: map[string]any{
+				"options": map[string]any{
+					"verbose": false,
+				},
+			},
+			overrideOpts: startupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"verbose":              true,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+			},
+		},
+		{
+			name: "config with verbose already set, post-startup override opts",
+			initialConfig: map[string]any{
+				"options": map[string]any{
+					"verbose": true,
+				},
+			},
+			overrideOpts: postStartupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"verbose":              false,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+			},
+		},
+		{
+			name: "config with distributed_interval already set, startup override opts",
+			initialConfig: map[string]any{
+				"options": map[string]any{
+					"distributed_interval": 30,
+				},
+			},
+			overrideOpts: startupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"verbose":              true,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+			},
+		},
+		{
+			name: "config with distributed_interval already set, post-startup override opts",
+			initialConfig: map[string]any{
+				"options": map[string]any{
+					"distributed_interval": 25,
+				},
+			},
+			overrideOpts: postStartupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"verbose":              false,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+			},
+		},
+		{
+			name: "config with other options, startup override opts",
+			initialConfig: map[string]any{
+				"options": map[string]any{
+					"audit_allow_config": false,
+				},
+			},
+			overrideOpts: startupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"audit_allow_config":   false,
+					"verbose":              true,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+			},
+		},
+		{
+			name: "config with decorators, post-startup override opts",
+			initialConfig: map[string]any{
+				"decorators": map[string]any{
+					"load": []any{
+						"SELECT version FROM osquery_info;",
+						"SELECT uuid AS host_uuid FROM system_info;",
+					},
+					"always": []any{
+						"SELECT user AS username FROM logged_in_users WHERE user <> '' ORDER BY time LIMIT 1;",
+					},
+					"interval": map[string]any{
+						"3600": []any{"SELECT total_seconds AS uptime FROM uptime;"},
+					},
+				},
+			},
+			overrideOpts: postStartupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"verbose":              false,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+				"decorators": map[string]any{
+					"load": []any{
+						"SELECT version FROM osquery_info;",
+						"SELECT uuid AS host_uuid FROM system_info;",
+					},
+					"always": []any{
+						"SELECT user AS username FROM logged_in_users WHERE user <> '' ORDER BY time LIMIT 1;",
+					},
+					"interval": map[string]any{
+						"3600": []any{"SELECT total_seconds AS uptime FROM uptime;"},
+					},
+				},
+			},
+		},
+		{
+			name: "config with auto table construction, startup override opts",
+			initialConfig: map[string]any{
+				"auto_table_construction": map[string]any{
+					"tcc_system_entries": map[string]any{
+						"query": "SELECT service, client, auth_value, last_modified FROM access;",
+						"path":  "/Library/Application Support/com.apple.TCC/TCC.db",
+						"columns": []any{
+							"service",
+							"client",
+							"auth_value",
+							"last_modified",
+						},
+						"platform": "darwin",
+					},
+				},
+			},
+			overrideOpts: startupOsqueryConfigOptions,
+			expectedConfig: map[string]any{
+				"options": map[string]any{
+					"verbose":              true,
+					"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+				},
+				"auto_table_construction": map[string]any{
+					"tcc_system_entries": map[string]any{
+						"query": "SELECT service, client, auth_value, last_modified FROM access;",
+						"path":  "/Library/Application Support/com.apple.TCC/TCC.db",
+						"columns": []any{
+							"service",
+							"client",
+							"auth_value",
+							"last_modified",
+						},
+						"platform": "darwin",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range testCases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			e := &Extension{
+				slogger: multislogger.NewNopLogger(),
+			}
+
+			cfgBytes, err := json.Marshal(tt.initialConfig)
+			require.NoError(t, err)
+
+			modifiedCfgStr := e.setOsqueryOptions(string(cfgBytes), tt.overrideOpts)
+
+			var modifiedCfg map[string]any
+			require.NoError(t, json.Unmarshal([]byte(modifiedCfgStr), &modifiedCfg))
+
+			require.Equal(t, tt.expectedConfig, modifiedCfg)
+		})
+	}
+}
+
+func Test_setOsqueryOptions_EmptyConfig(t *testing.T) {
+	t.Parallel()
+
+	e := &Extension{
+		slogger: multislogger.NewNopLogger(),
+	}
+
+	expectedCfg := map[string]any{
+		"options": map[string]any{
+			"verbose":              true,
+			"distributed_interval": float64(osqueryDistributedInterval), // has to be a float64 due to json unmarshal nonsense
+		},
+	}
+
+	modifiedCfgStr := e.setOsqueryOptions("", startupOsqueryConfigOptions)
+
+	var modifiedCfg map[string]any
+	require.NoError(t, json.Unmarshal([]byte(modifiedCfgStr), &modifiedCfg))
+
+	require.Equal(t, expectedCfg, modifiedCfg)
+}
+
+func Test_setVerbose_MalformedConfig(t *testing.T) {
+	t.Parallel()
+
+	e := &Extension{
+		slogger: multislogger.NewNopLogger(),
+	}
+
+	malformedCfg := map[string]any{
+		"options": "options should not be a string, yet it is, oops",
+	}
+	cfgBytes, err := json.Marshal(malformedCfg)
 	require.NoError(t, err)
+	modifiedCfgStr := e.setOsqueryOptions(string(cfgBytes), postStartupOsqueryConfigOptions)
 
-	configStore, err := agentbbolt.NewStore(log.NewNopLogger(), db, storage.ConfigStore.String())
-	require.NoError(t, err)
+	var modifiedCfg map[string]any
+	require.NoError(t, json.Unmarshal([]byte(modifiedCfgStr), &modifiedCfg))
 
-	key, err := PrivateRSAKeyFromDB(configStore)
-	require.NoError(t, err)
-
-	pubkeyPem, fingerprintStored, err := PublicRSAKeyFromDB(configStore)
-	require.NoError(t, err)
-
-	fingerprint, err := rsaFingerprint(key)
-	require.NoError(t, err)
-	require.Equal(t, fingerprint, fingerprintStored)
-
-	pubkey, err := KeyFromPem([]byte(pubkeyPem))
-	require.NoError(t, err)
-
-	require.Equal(t, &key.PublicKey, pubkey)
+	require.Equal(t, malformedCfg, modifiedCfg)
 }

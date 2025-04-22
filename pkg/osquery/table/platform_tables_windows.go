@@ -4,27 +4,29 @@
 package table
 
 import (
-	"github.com/kolide/launcher/pkg/osquery/tables/dataflattentable"
-	"github.com/kolide/launcher/pkg/osquery/tables/dsim_default_associations"
-	"github.com/kolide/launcher/pkg/osquery/tables/execparsers/dsregcmd"
-	"github.com/kolide/launcher/pkg/osquery/tables/secedit"
-	"github.com/kolide/launcher/pkg/osquery/tables/wifi_networks"
-	"github.com/kolide/launcher/pkg/osquery/tables/windowsupdatetable"
-	"github.com/kolide/launcher/pkg/osquery/tables/wmitable"
+	"log/slog"
 
-	"github.com/go-kit/kit/log"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/allowedcmd"
+	"github.com/kolide/launcher/ee/tables/dataflattentable"
+	"github.com/kolide/launcher/ee/tables/dsim_default_associations"
+	"github.com/kolide/launcher/ee/tables/execparsers/dsregcmd"
+	"github.com/kolide/launcher/ee/tables/secedit"
+	"github.com/kolide/launcher/ee/tables/wifi_networks"
+	"github.com/kolide/launcher/ee/tables/windowsupdatetable"
+	"github.com/kolide/launcher/ee/tables/wmitable"
 	osquery "github.com/osquery/osquery-go"
 )
 
-func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, currentOsquerydBinaryPath string) []osquery.OsqueryPlugin {
+func platformSpecificTables(k types.Knapsack, slogger *slog.Logger, currentOsquerydBinaryPath string) []osquery.OsqueryPlugin {
 	return []osquery.OsqueryPlugin{
-		ProgramIcons(),
-		dsim_default_associations.TablePlugin(client, logger),
-		secedit.TablePlugin(client, logger),
-		wifi_networks.TablePlugin(client, logger),
-		windowsupdatetable.TablePlugin(windowsupdatetable.UpdatesTable, client, logger),
-		windowsupdatetable.TablePlugin(windowsupdatetable.HistoryTable, client, logger),
-		wmitable.TablePlugin(client, logger),
-		dataflattentable.NewExecAndParseTable(logger, "kolide_dsregcmd", dsregcmd.Parser, []string{`/Windows/System32/dsregcmd.exe`, `/status`}),
+		ProgramIcons(k, slogger),
+		dsim_default_associations.TablePlugin(k, slogger),
+		secedit.TablePlugin(k, slogger),
+		wifi_networks.TablePlugin(k, slogger),
+		windowsupdatetable.TablePlugin(windowsupdatetable.UpdatesTable, k, slogger),
+		windowsupdatetable.TablePlugin(windowsupdatetable.HistoryTable, k, slogger),
+		wmitable.TablePlugin(k, slogger),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_dsregcmd", dsregcmd.Parser, allowedcmd.Dsregcmd, []string{`/status`}),
 	}
 }

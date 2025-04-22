@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -14,115 +15,137 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/kit/logutil"
 	"github.com/kolide/kit/version"
-	"github.com/kolide/launcher/pkg/autoupdate"
+	"github.com/kolide/launcher/ee/gowrapper"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 	"github.com/kolide/launcher/pkg/launcher"
-	"github.com/kolide/launcher/pkg/log/eventlog"
 	"github.com/kolide/launcher/pkg/log/locallogger"
-	"github.com/kolide/launcher/pkg/log/teelogger"
-
+	"github.com/kolide/launcher/pkg/log/multislogger"
+	"github.com/pkg/errors"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 )
 
-// TODO This should be inherited from some setting
-const serviceName = "launcher"
+const (
+	serviceName                        = "launcher" // TODO This should be inherited from some setting
+	serviceShutdownTimeoutMilliseconds = 20000      // 20 seconds
+)
 
 // runWindowsSvc starts launcher as a windows service. This will
 // probably not behave correctly if you start it from the command line.
-func runWindowsSvc(args []string) error {
-	eventLogWriter, err := eventlog.NewWriter(serviceName)
-	if err != nil {
-		return fmt.Errorf("create eventlog writer: %w", err)
-	}
-	defer eventLogWriter.Close()
-
-	logger := eventlog.New(eventLogWriter)
-	logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
-
-	level.Debug(logger).Log(
-		"msg", "service start requested",
+// This method is responsible for calling svc.Run, which eventually translates into the
+// Execute function below. Each device has a global ServicesPipeTimeout value (typically at
+// 30-45 seconds but depends on the configuration of the device). We have that many seconds
+// to get from here to the point in Execute where we return a service status of Running before
+// service control manager will consider the start attempt to have timed out, cancel it,
+// and proceed without attempting restart.
+// Wherever possible, we should keep any connections or timely operations out of this method,
+// and ensure they are added late enough in Execute to avoid hitting this timeout.
+func runWindowsSvc(systemSlogger *multislogger.MultiSlogger, args []string) error {
+	systemSlogger.Log(context.TODO(), slog.LevelInfo,
+		"service start requested",
 		"version", version.Version().Version,
 	)
 
-	opts, err := parseOptions(os.Args[2:])
+	opts, err := launcher.ParseOptions("", os.Args[2:])
 	if err != nil {
-		level.Info(logger).Log("msg", "Error parsing options", "err", err)
-		os.Exit(1)
-	}
-
-	// Create a local logger. This logs to a known path, and aims to help diagnostics
-	if opts.RootDirectory != "" {
-		logger = teelogger.New(logger, locallogger.NewKitLogger(filepath.Join(opts.RootDirectory, "debug.json")))
-		locallogger.CleanUpRenamedDebugLogs(opts.RootDirectory, logger)
-	}
-
-	// Now that we've parsed the options, let's set a filter on our logger
-	if opts.Debug {
-		logger = level.NewFilter(logger, level.AllowDebug())
-	} else {
-		logger = level.NewFilter(logger, level.AllowInfo())
-	}
-
-	// Use the FindNewest mechanism to delete old
-	// updates. We do this here, as windows will pick up
-	// the update in main, which does not delete.  Note
-	// that this will likely produce non-fatal errors when
-	// it tries to delete the running one.
-	go func() {
-		time.Sleep(15 * time.Second)
-		_ = autoupdate.FindNewest(
-			ctxlog.NewContext(context.TODO(), logger),
-			os.Args[0],
-			autoupdate.DeleteOldUpdates(),
+		systemSlogger.Log(context.TODO(), slog.LevelInfo,
+			"error parsing options",
+			"err", err,
 		)
-	}()
+		return fmt.Errorf("parsing options: %w", err)
+	}
 
-	level.Info(logger).Log(
-		"msg", "launching service",
+	localSlogger := multislogger.New()
+	logger := log.NewNopLogger()
+
+	if opts.RootDirectory != "" {
+		// Create a local logger. This logs to a known path, and aims to help diagnostics
+		ll := locallogger.NewKitLogger(filepath.Join(opts.RootDirectory, "debug.json"))
+		logger = ll
+
+		localSloggerHandler := slog.NewJSONHandler(ll.Writer(), &slog.HandlerOptions{
+			AddSource: true,
+			Level:     slog.LevelDebug,
+		})
+
+		localSlogger.AddHandler(localSloggerHandler)
+
+		// also write system logs to localSloggerHandler
+		systemSlogger.AddHandler(localSloggerHandler)
+	}
+
+	systemSlogger.Log(context.TODO(), slog.LevelInfo,
+		"launching service",
 		"version", version.Version().Version,
 	)
 
 	// Log panics from the windows service
 	defer func() {
 		if r := recover(); r != nil {
-			level.Info(logger).Log(
-				"msg", "panic occurred",
-				"err", err,
+			systemSlogger.Log(context.TODO(), slog.LevelInfo,
+				"panic occurred in windows service",
+				"err", r,
 			)
+			if err, ok := r.(error); ok {
+				systemSlogger.Log(context.TODO(), slog.LevelInfo,
+					"panic stack trace",
+					"stack_trace", fmt.Sprintf("%+v", errors.WithStack(err)),
+				)
+			}
 			time.Sleep(time.Second)
 		}
 	}()
 
-	if err := svc.Run(serviceName, &winSvc{logger: logger, opts: opts}); err != nil {
+	if err := svc.Run(serviceName, &winSvc{
+		logger:        logger,
+		slogger:       localSlogger,
+		systemSlogger: systemSlogger,
+		opts:          opts,
+	}); err != nil {
 		// TODO The caller doesn't have the event log configured, so we
 		// need to log here. this implies we need some deeper refactoring
 		// of the logging
-		level.Info(logger).Log(
-			"msg", "Error in service run",
+		systemSlogger.Log(context.TODO(), slog.LevelInfo,
+			"error in service run",
 			"err", err,
-			"version", version.Version().Version,
 		)
 		time.Sleep(time.Second)
 		return err
 	}
 
-	level.Debug(logger).Log("msg", "Service exited", "version", version.Version().Version)
+	systemSlogger.Log(context.TODO(), slog.LevelInfo,
+		"service exited",
+	)
+
 	time.Sleep(time.Second)
 
 	return nil
 }
 
-func runWindowsSvcForeground(args []string) error {
+func runWindowsSvcForeground(systemSlogger *multislogger.MultiSlogger, args []string) error {
+	attachConsole()
+	defer detachConsole()
+
 	// Foreground mode is inherently a debug mode. So we start the
 	// logger in debugging mode, instead of looking at opts.debug
 	logger := logutil.NewCLILogger(true)
 	level.Debug(logger).Log("msg", "foreground service start requested (debug mode)")
 
-	opts, err := parseOptions(os.Args[2:])
+	// Use new logger to write logs to stdout
+	localSlogger := new(multislogger.MultiSlogger)
+
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true,
+		Level:     slog.LevelDebug,
+	})
+	localSlogger.AddHandler(handler)
+	systemSlogger.AddHandler(handler)
+
+	opts, err := launcher.ParseOptions("", os.Args[2:])
 	if err != nil {
 		level.Info(logger).Log("err", err)
-		os.Exit(1)
+		return fmt.Errorf("parsing options: %w", err)
 	}
 
 	// set extra debug options
@@ -131,42 +154,60 @@ func runWindowsSvcForeground(args []string) error {
 
 	run := debug.Run
 
-	return run(serviceName, &winSvc{logger: logger, opts: opts})
+	return run(serviceName, &winSvc{logger: logger, slogger: localSlogger, systemSlogger: systemSlogger, opts: opts})
 }
 
 type winSvc struct {
-	logger log.Logger
-	opts   *launcher.Options
+	logger                 log.Logger
+	slogger, systemSlogger *multislogger.MultiSlogger
+	opts                   *launcher.Options
 }
 
 func (w *winSvc) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
-	changes <- svc.Status{State: svc.StartPending}
-	level.Debug(w.logger).Log("msg", "windows service starting")
-	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ctx = ctxlog.NewContext(ctx, w.logger)
+	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
+	changes <- svc.Status{State: svc.StartPending}
+	w.systemSlogger.Log(ctx, slog.LevelInfo,
+		"windows service starting",
+	)
+	// after this point windows service control manager will know that we've successfully started,
+	// it is safe to begin longer running operations
+	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
-	go func() {
-		err := runLauncher(ctx, cancel, w.opts)
+	// Confirm that service configuration is up-to-date
+	gowrapper.Go(ctx, w.systemSlogger.Logger, func() {
+		checkServiceConfiguration(w.slogger.Logger, w.opts)
+	})
+
+	ctx = ctxlog.NewContext(ctx, w.logger)
+	runLauncherResults := make(chan struct{})
+
+	gowrapper.GoWithRecoveryAction(ctx, w.systemSlogger.Logger, func() {
+		err := runLauncher(ctx, cancel, w.slogger, w.systemSlogger, w.opts)
 		if err != nil {
-			level.Info(w.logger).Log("msg", "runLauncher exited", "err", err)
-			level.Debug(w.logger).Log("msg", "runLauncher exited", "err", err, "stack", fmt.Sprintf("%+v", err))
-			changes <- svc.Status{State: svc.Stopped, Accepts: cmdsAccepted}
-			os.Exit(1)
+			w.systemSlogger.Log(ctx, slog.LevelInfo,
+				"runLauncher exited",
+				"err", err,
+				"stack_trace", fmt.Sprintf("%+v", errors.WithStack(err)),
+			)
+		} else {
+			w.systemSlogger.Log(ctx, slog.LevelInfo,
+				"runLauncher exited cleanly",
+			)
 		}
 
-		// If we get here, it means runLauncher returned nil. If we do
-		// nothing, the service is left running, but with no
-		// functionality. Instead, signal that as a stop to the service
-		// manager, and exit. We rely on the service manager to restart.
-		level.Info(w.logger).Log("msg", "runLauncher exited cleanly")
-		changes <- svc.Status{State: svc.Stopped, Accepts: cmdsAccepted}
-		os.Exit(0)
-	}()
+		// Since launcher shut down, we must signal to fully exit so that the service manager can restart the service.
+		runLauncherResults <- struct{}{}
+	}, func(r any) {
+		w.systemSlogger.Log(ctx, slog.LevelError,
+			"exiting after runLauncher panic",
+			"err", r,
+		)
+		// Since launcher shut down, we must signal to fully exit so that the service manager can restart the service.
+		runLauncherResults <- struct{}{}
+	})
 
 	for {
 		select {
@@ -178,15 +219,48 @@ func (w *winSvc) Execute(args []string, r <-chan svc.ChangeRequest, changes chan
 				time.Sleep(100 * time.Millisecond)
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
-				level.Info(w.logger).Log("msg", "shutdown request received")
-				changes <- svc.Status{State: svc.StopPending}
+				w.systemSlogger.Log(ctx, slog.LevelInfo,
+					"shutdown request received",
+				)
+				// launcher's rungroup can take up to 15 seconds to shut down. We want to give it
+				// the full 15+ seconds if possible, to allow it to gracefully shut down
+				// and to allow deferred calls in runLauncher (e.g. db.Close) to run.
+				// Documentation indicates we are allowed to take approximately 20 seconds
+				// to respond to svc.Shutdown, so we wait up to that amount of time.
+				// See: https://learn.microsoft.com/en-us/windows/win32/services/service-control-handler-function
+				changes <- svc.Status{State: svc.StopPending, WaitHint: serviceShutdownTimeoutMilliseconds}
 				cancel()
-				time.Sleep(100 * time.Millisecond)
+				select {
+				case <-runLauncherResults:
+					w.systemSlogger.Log(ctx, slog.LevelInfo,
+						"runLauncher successfully returned after shutdown call",
+					)
+				case <-time.After(serviceShutdownTimeoutMilliseconds * time.Millisecond):
+					w.systemSlogger.Log(ctx, slog.LevelWarn,
+						"runLauncher did not return within timeout after calling cancel",
+						"timeout_ms", serviceShutdownTimeoutMilliseconds,
+					)
+				}
 				changes <- svc.Status{State: svc.Stopped, Accepts: cmdsAccepted}
-				return
+				return ssec, errno
+			case svc.Pause, svc.Continue, svc.ParamChange, svc.NetBindAdd, svc.NetBindRemove, svc.NetBindEnable, svc.NetBindDisable, svc.DeviceEvent, svc.HardwareProfileChange, svc.PowerEvent, svc.SessionChange, svc.PreShutdown:
+				fallthrough
 			default:
-				level.Info(w.logger).Log("err", "unexpected control request", "control_request", c)
+				w.systemSlogger.Log(ctx, slog.LevelInfo,
+					"unexpected change request",
+					"change_request", fmt.Sprintf("%+v", c),
+				)
 			}
+		case <-runLauncherResults:
+			w.systemSlogger.Log(ctx, slog.LevelInfo,
+				"shutting down service after runLauncher exited",
+			)
+			// We don't want to tell the service manager that we've stopped on purpose,
+			// so that the service manager will restart launcher correctly.
+			// We use this error code largely because the windows/svc code also uses it
+			// and it seems semantically correct enough; it doesn't appear to matter to us
+			// what the code is.
+			return false, uint32(windows.ERROR_EXCEPTION_IN_SERVICE)
 		}
 	}
 }

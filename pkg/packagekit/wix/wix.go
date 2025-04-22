@@ -3,6 +3,7 @@ package wix
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,21 +12,25 @@ import (
 	"strings"
 
 	"github.com/go-kit/kit/log/level"
+	"github.com/kolide/kit/fsutil"
+	"github.com/kolide/kit/ulid"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 )
 
 type wixTool struct {
-	wixPath        string     // Where is wix installed
-	packageRoot    string     // What's the root of the packaging files?
-	buildDir       string     // The wix tools want to work in a build dir.
-	msArch         string     // What's the Microsoft architecture name?
-	services       []*Service // array of services.
-	dockerImage    string     // If in docker, what image?
-	skipValidation bool       // Skip light validation. Seems to be needed for running in 32bit wine environments.
-	skipCleanup    bool       // Skip cleaning temp dirs. Useful when debugging wix generation
-	cleanDirs      []string   // directories to rm on cleanup
-	ui             bool       // whether or not to include a ui
-	extraFiles     []extraFile
+	wixPath         string     // Where is wix installed
+	packageRoot     string     // What's the root of the packaging files?
+	packageDataRoot string     // What's the root for the data directory packaging files?
+	buildDir        string     // The wix tools want to work in a build dir.
+	msArch          string     // What's the Microsoft architecture name?
+	services        []*Service // array of services.
+	dockerImage     string     // If in docker, what image?
+	skipValidation  bool       // Skip light validation. Seems to be needed for running in 32bit wine environments.
+	skipCleanup     bool       // Skip cleaning temp dirs. Useful when debugging wix generation
+	cleanDirs       []string   // directories to rm on cleanup
+	ui              bool       // whether or not to include a ui
+	extraFiles      []extraFile
+	identifier      string // the package identifier used for directory path creation (e.g. kolide-k2)
 
 	execCC func(context.Context, string, ...string) *exec.Cmd // Allows test overrides
 }
@@ -78,14 +83,12 @@ func WithBuildDir(path string) WixOpt {
 func WithDocker(image string) WixOpt {
 	return func(wo *wixTool) {
 		wo.dockerImage = image
-
 	}
 }
 
 func WithUI() WixOpt {
 	return func(wo *wixTool) {
 		wo.ui = true
-
 	}
 }
 
@@ -104,12 +107,12 @@ func SkipCleanup() WixOpt {
 // New takes a packageRoot of files, and a wxsContent of xml wix
 // configuration, and will return a struct with methods for building
 // packages with.
-func New(packageRoot string, mainWxsContent []byte, wixOpts ...WixOpt) (*wixTool, error) {
+func New(packageRoot string, identifier string, mainWxsContent []byte, wixOpts ...WixOpt) (*wixTool, error) {
 	wo := &wixTool{
 		wixPath:     FindWixInstall(),
 		packageRoot: packageRoot,
-
-		execCC: exec.CommandContext,
+		identifier:  identifier,
+		execCC:      exec.CommandContext, //nolint:forbidigo // Fine to use exec.CommandContext outside of launcher proper
 	}
 
 	for _, opt := range wixOpts {
@@ -160,6 +163,15 @@ func New(packageRoot string, mainWxsContent []byte, wixOpts ...WixOpt) (*wixTool
 // Cleanup removes temp directories. Meant to be called in a defer.
 func (wo *wixTool) Cleanup() {
 	if wo.skipCleanup {
+		// if the wix_skip_cleanup flag is set, we don't want to clean up the temp directories
+		// this is useful when debugging wix generation
+		// print the directories that would be cleaned up so they can be easily found
+		// and inspected
+		fmt.Print("skipping cleanup of temp directories\n")
+		for _, d := range wo.cleanDirs {
+			fmt.Printf("skipping cleanup of %s\n", d)
+		}
+
 		return
 	}
 
@@ -171,6 +183,10 @@ func (wo *wixTool) Cleanup() {
 // Package will run through the wix steps to produce a resulting
 // package. The path for the resultant package will be returned.
 func (wo *wixTool) Package(ctx context.Context) (string, error) {
+	if err := wo.setupDataDir(ctx); err != nil {
+		return "", fmt.Errorf("adding data file stubs: %w", err)
+	}
+
 	if err := wo.heat(ctx); err != nil {
 		return "", fmt.Errorf("running heat: %w", err)
 	}
@@ -218,24 +234,136 @@ func (wo *wixTool) addServices(ctx context.Context) error {
 	}
 	defer heatWrite.Close()
 
+	type archSpecificBinDir string
+
+	const (
+		none  archSpecificBinDir = ""
+		amd64 archSpecificBinDir = "amd64"
+		arm64 archSpecificBinDir = "arm64"
+	)
+	currentArchSpecificBinDir := none
+
+	baseSvcName := wo.services[0].serviceInstall.Id
+
 	lines := strings.Split(string(heatContent), "\n")
 	for _, line := range lines {
+
+		if currentArchSpecificBinDir != none && strings.Contains(line, "</Directory>") {
+			// were in a arch specific bin dir that we want to remove, don't write closing tag
+			currentArchSpecificBinDir = none
+			continue
+		}
+
+		// the directory tag will look like "<Directory Id="xxxx"...>"
+		// so we just check for the first part of the string
+		if strings.Contains(line, "<Directory") {
+			if strings.Contains(line, string(amd64)) {
+				// were in a arch specific bin dir that we want to remove, skip opening tag
+				// and set current arch specific bin dir so we'll skip closing tag as well
+				currentArchSpecificBinDir = amd64
+				continue
+			}
+
+			if strings.Contains(line, string(arm64)) {
+				// were in a arch specific bin dir that we want to remove, skip opening tag
+				// and set current arch specific bin dir so we'll skip closing tag as well
+				currentArchSpecificBinDir = arm64
+				continue
+			}
+		}
+
 		heatWrite.WriteString(line)
 		heatWrite.WriteString("\n")
+
 		for _, service := range wo.services {
+
 			isMatch, err := service.Match(line)
 			if err != nil {
 				return fmt.Errorf("match error: %w", err)
 			}
+
 			if isMatch {
+				if currentArchSpecificBinDir == none {
+					return errors.New("service found, but not in a bin directory")
+				}
+
+				// make sure elements are not duplicated in any service
+				serviceId := fmt.Sprintf("%s%s", baseSvcName, ulid.New())
+				service.serviceControl.Id = serviceId
+				service.serviceInstall.Id = serviceId
+				service.serviceInstall.ServiceConfig.Id = serviceId
+
+				// unfortunately, the UtilServiceConfig uses the name of the launcher service as a primary key
+				// since we have multiple services with the same name, we can't have multiple UtilServiceConfigs
+				// so we are skipping it for arm64 since it's a much smaller portion of our user base. The correct
+				// UtilServiceConfig will set when launcher starts up.
+				if currentArchSpecificBinDir == arm64 {
+					service.serviceInstall.UtilServiceConfig = nil
+				}
+
+				// create a condition based on architecture
+				// have to format in the "%P" in "%PROCESSOR_ARCHITECTURE"
+				heatWrite.WriteString(fmt.Sprintf(`<Condition> %sROCESSOR_ARCHITECTURE="%s" </Condition>`, "%P", strings.ToUpper(string(currentArchSpecificBinDir))))
+				heatWrite.WriteString("\n")
+
 				if err := service.Xml(heatWrite); err != nil {
 					return fmt.Errorf("adding service: %w", err)
 				}
+
+				continue
+			}
+
+			if strings.Contains(line, "osqueryd.exe") {
+				if currentArchSpecificBinDir == none {
+					return errors.New("osqueryd.exe found, but not in a bin directory")
+				}
+
+				// create a condition based on architecture
+				heatWrite.WriteString(fmt.Sprintf(`<Condition> %sROCESSOR_ARCHITECTURE="%s" </Condition>`, "%P", strings.ToUpper(string(currentArchSpecificBinDir))))
+				heatWrite.WriteString("\n")
 			}
 		}
 	}
 
 	return nil
+}
+
+// setupDataDir handles the windows data directory setup by pre-creating any files
+// that we want to ensure are cleaned up on uninstall.
+// this is handled before the other heat/candle/light calls because we must issue
+// a separate heat call to harvest the data directory in ProgramData instead of Program Files
+func (wo *wixTool) setupDataDir(ctx context.Context) error {
+	var err error
+	wo.packageDataRoot, err = os.MkdirTemp("", "package.packageDataRoot")
+	if err != nil {
+		return fmt.Errorf("unable to create temporary packaging data directory: %w", err)
+	}
+
+	wo.cleanDirs = append(wo.cleanDirs, wo.packageDataRoot)
+
+	fullIdentifier := fmt.Sprintf("Launcher-%s", wo.identifier)
+	dataFilesPath := filepath.Join(wo.packageDataRoot, fullIdentifier, "data")
+
+	if err := os.MkdirAll(dataFilesPath, fsutil.DirMode); err != nil {
+		return fmt.Errorf("create base data dir error for wix harvest: %w", err)
+	}
+
+	_, err = wo.execOut(ctx,
+		filepath.Join(wo.wixPath, "heat.exe"),
+		"dir", wo.packageDataRoot,
+		"-nologo",
+		"-gg", "-g1",
+		"-srd",
+		"-sfrag",
+		"-ke",
+		"-cg", "AppData",
+		"-template", "fragment",
+		"-dr", "DATADIR",
+		"-var", "var.SourceDataDir",
+		"-out", "AppData.wxs",
+	)
+
+	return err
 }
 
 // heat invokes wix's heat command. This examines a directory and
@@ -261,6 +389,7 @@ func (wo *wixTool) heat(ctx context.Context) error {
 		"-var", "var.SourceDir",
 		"-out", "AppFiles.wxs",
 	)
+
 	return err
 }
 
@@ -273,9 +402,11 @@ func (wo *wixTool) candle(ctx context.Context) error {
 		"-nologo",
 		"-arch", wo.msArch,
 		"-dSourceDir="+wo.packageRoot,
+		"-dSourceDataDir="+wo.packageDataRoot,
 		"-ext", "WixUtilExtension",
 		"Installer.wxs",
 		"AppFiles.wxs",
+		"AppData.wxs",
 	)
 	return err
 }
@@ -288,8 +419,10 @@ func (wo *wixTool) light(ctx context.Context) error {
 		"-nologo",
 		"-dcl:high", // compression level
 		"-dSourceDir=" + wo.packageRoot,
+		"-dSourceDataDir=" + wo.packageDataRoot,
 		"-ext", "WixUtilExtension",
 		"AppFiles.wixobj",
+		"AppData.wixobj",
 		"Installer.wixobj",
 		"-out", "out.msi",
 	}
@@ -317,6 +450,7 @@ func (wo *wixTool) execOut(ctx context.Context, argv0 string, args ...string) (s
 		"run",
 		"--entrypoint", "",
 		"-v", fmt.Sprintf("%s:%s", wo.packageRoot, wo.packageRoot),
+		"-v", fmt.Sprintf("%s:%s", wo.packageDataRoot, wo.packageDataRoot),
 		"-v", fmt.Sprintf("%s:%s", wo.buildDir, wo.buildDir),
 		"-w", wo.buildDir,
 		wo.dockerImage,

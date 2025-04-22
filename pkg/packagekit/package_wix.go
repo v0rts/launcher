@@ -6,17 +6,21 @@ import (
 	"embed"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"text/template"
 
 	"github.com/google/uuid"
+	"github.com/kolide/kit/version"
 	"github.com/kolide/launcher/pkg/packagekit/authenticode"
 	"github.com/kolide/launcher/pkg/packagekit/wix"
-
-	"go.opencensus.io/trace"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // We need to use variables to stub various parts of the wix
@@ -37,16 +41,18 @@ var wixTemplateBytes []byte
 //go:embed assets/*
 var assets embed.FS
 
-const (
-	signtoolPath = `C:\Program Files (x86)\Windows Kits\10\bin\10.0.18362.0\x64\signtool.exe`
-)
+var signtoolVersionRegex = regexp.MustCompile(`^(.+)\/x64\/signtool\.exe$`)
 
 func PackageWixMSI(ctx context.Context, w io.Writer, po *PackageOptions, includeService bool) error {
-	ctx, span := trace.StartSpan(ctx, "packagekit.PackageWixMSI")
-	defer span.End()
-
 	if err := isDirectory(po.Root); err != nil {
 		return err
+	}
+
+	// populate VersionNum if it isn't already set by the caller. we'll
+	// store this in the registry on install to give a comparable field
+	// for intune to drive upgrade behavior from
+	if po.VersionNum == 0 {
+		po.VersionNum = version.VersionNumFromSemver(po.Version)
 	}
 
 	// We include a random nonce as part of the ProductCode
@@ -69,13 +75,17 @@ func PackageWixMSI(ctx context.Context, w io.Writer, po *PackageOptions, include
 	}
 
 	var templateData = struct {
-		Opts        *PackageOptions
-		UpgradeCode string
-		ProductCode string
+		Opts            *PackageOptions
+		UpgradeCode     string
+		ProductCode     string
+		PermissionsGUID string
 	}{
 		Opts:        po,
 		UpgradeCode: generateMicrosoftProductCode("launcher" + po.Identifier),
 		ProductCode: generateMicrosoftProductCode("launcher"+po.Identifier, extraGuidIdentifiers...),
+		// our permissions component does not meet the criteria to have it's GUID automatically generated - but we should
+		// ensure it is unique for each build so we regenerate here alongside the product and upgrade codes
+		PermissionsGUID: generateMicrosoftProductCode("launcher_root_dir_permissions"+po.Identifier, extraGuidIdentifiers...),
 	}
 
 	wixTemplate, err := template.New("WixTemplate").Parse(string(wixTemplateBytes))
@@ -120,8 +130,9 @@ func PackageWixMSI(ctx context.Context, w io.Writer, po *PackageOptions, include
 
 	if includeService {
 		launcherService := wix.NewService("launcher.exe",
-			wix.WithDelayedStart(),
-			wix.ServiceName(fmt.Sprintf("Launcher%sSvc", strings.Title(po.Identifier))),
+			// Ensure that the service does not start until DNS is available, to avoid unrecoverable DNS failures in launcher.
+			wix.WithServiceDependency("Dnscache"),
+			wix.ServiceName(fmt.Sprintf("Launcher%sSvc", cases.Title(language.Und, cases.NoLower).String(po.Identifier))),
 			wix.ServiceArgs([]string{"svc", "-config", po.FlagFile}),
 			wix.ServiceDescription(fmt.Sprintf("The Kolide Launcher (%s)", po.Identifier)),
 		)
@@ -133,7 +144,7 @@ func PackageWixMSI(ctx context.Context, w io.Writer, po *PackageOptions, include
 		wixArgs = append(wixArgs, wix.WithService(launcherService))
 	}
 
-	wixTool, err := wix.New(po.Root, mainWxsContent.Bytes(), wixArgs...)
+	wixTool, err := wix.New(po.Root, po.Identifier, mainWxsContent.Bytes(), wixArgs...)
 	if err != nil {
 		return fmt.Errorf("making wixTool: %w", err)
 	}
@@ -147,6 +158,10 @@ func PackageWixMSI(ctx context.Context, w io.Writer, po *PackageOptions, include
 
 	// Sign?
 	if po.WindowsUseSigntool {
+		signtoolPath, err := getSigntoolPath()
+		if err != nil {
+			return fmt.Errorf("looking up signtool location: %w", err)
+		}
 		if err := authenticode.Sign(
 			ctx, msiFile,
 			authenticode.WithExtraArgs(po.WindowsSigntoolArgs),
@@ -167,9 +182,52 @@ func PackageWixMSI(ctx context.Context, w io.Writer, po *PackageOptions, include
 		return fmt.Errorf("copying output: %w", err)
 	}
 
-	setInContext(ctx, ContextLauncherVersionKey, po.Version)
+	SetInContext(ctx, ContextLauncherVersionKey, po.Version)
 
 	return nil
+}
+
+// getSigntoolPath attempts to look up the location of signtool so that
+// we do not have to rely on a hard-coded signtool location that will change
+// when we upgrade to a new version of signtool.
+func getSigntoolPath() (string, error) {
+	var signtoolPath string
+	signtoolVersion := "0.0.0.0"
+
+	root := `C:\Program Files (x86)\Windows Kits\10\bin` // restrict our lookup to a well-known location
+	fileSystem := os.DirFS(root)
+
+	if err := fs.WalkDir(fileSystem, ".", func(currentPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// We expect signing to happen on a build machine with 64-bit architecture, so we restrict
+		// our matches accordingly
+		if !d.IsDir() && strings.HasSuffix(currentPath, `x64/signtool.exe`) {
+			// Parse out the version -- we expect the current path to look something like 10.0.18362.0/x64/signtool.exe
+			versionMatches := signtoolVersionRegex.FindStringSubmatch(currentPath)
+			if len(versionMatches) < 2 {
+				return nil
+			}
+
+			// We can't parse it as a semver, but simple string comparison works fine.
+			if versionMatches[1] > signtoolVersion {
+				signtoolVersion = versionMatches[1]
+				signtoolPath = filepath.Join(root, currentPath)
+			}
+
+			return nil
+		}
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("walking %s: %w", root, err)
+	}
+
+	if signtoolPath == "" {
+		return "", fmt.Errorf("signtool.exe not found in %s", root)
+	}
+
+	return signtoolPath, nil
 }
 
 // generateMicrosoftProductCode create a stable guid from a set of

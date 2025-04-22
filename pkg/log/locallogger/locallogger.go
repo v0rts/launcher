@@ -2,11 +2,9 @@ package locallogger
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
 
 	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -16,9 +14,10 @@ const (
 
 type localLogger struct {
 	logger log.Logger
+	writer io.Writer
 }
 
-func NewKitLogger(logFilePath string) log.Logger {
+func NewKitLogger(logFilePath string) localLogger {
 	// This is meant as an always available debug tool. Thus we hardcode these options
 	lj := &lumberjack.Logger{
 		Filename:   logFilePath,
@@ -27,12 +26,15 @@ func NewKitLogger(logFilePath string) log.Logger {
 		MaxBackups: 5,
 	}
 
+	writer := log.NewSyncWriter(lj)
+
 	ll := localLogger{
 		logger: log.With(
-			log.NewJSONLogger(log.NewSyncWriter(lj)),
+			log.NewJSONLogger(writer),
 			"ts", log.DefaultTimestampUTC,
 			"caller", log.DefaultCaller, ///log.Caller(6),
 		),
+		writer: writer,
 	}
 
 	return ll
@@ -43,24 +45,8 @@ func (ll localLogger) Log(keyvals ...interface{}) error {
 	return ll.logger.Log(keyvals...)
 }
 
-func CleanUpRenamedDebugLogs(cleanupPath string, logger log.Logger) {
-	// We renamed the debug log file from debug.log to debug.json for compatibility with support tools.
-	// Check to see if we have any of the old debug.log files still hanging around, and clean them up
-	// if so. The current one is always named debug.log, and rotated files are in the format
-	// `debug-<date>.log.gz`. We do not return an error if we can't clean up these files -- it's not
-	// a big deal.
-	legacyDebugLogPattern := filepath.Join(cleanupPath, "debug*.log*")
-	filesToCleanUp, err := filepath.Glob(legacyDebugLogPattern)
-	if err != nil {
-		level.Error(logger).Log("msg", "could not glob for legacy debug log files to clean up", "pattern", legacyDebugLogPattern, "err", err)
-		return
-	}
-
-	for _, fileToCleanUp := range filesToCleanUp {
-		if err := os.Remove(fileToCleanUp); err != nil {
-			level.Error(logger).Log("msg", "could not clean up legacy debug log file", "file", fileToCleanUp, "err", err)
-		}
-	}
+func (ll localLogger) Writer() io.Writer {
+	return ll.writer
 }
 
 // filterResults filteres out the osquery results,

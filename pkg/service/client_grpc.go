@@ -3,25 +3,25 @@ package service
 import (
 	"context"
 	"crypto/x509"
-	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
 	grpctransport "github.com/go-kit/kit/transport/grpc"
 	"github.com/kolide/kit/contexts/uuid"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/kolide/launcher/ee/agent/types"
 	pb "github.com/kolide/launcher/pkg/pb/launcher"
 )
 
 // New creates a new Kolide Client (implementation of the KolideService
 // interface) using the provided gRPC client connection.
-func NewGRPCClient(conn *grpc.ClientConn, logger log.Logger) KolideService {
+func NewGRPCClient(k types.Knapsack, conn *grpc.ClientConn) KolideService {
 	requestEnrollmentEndpoint := grpctransport.NewClient(
 		conn,
 		"kolide.agent.Api",
@@ -91,7 +91,7 @@ func NewGRPCClient(conn *grpc.ClientConn, logger log.Logger) KolideService {
 		CheckHealthEndpoint:       checkHealthEndpoint,
 	}
 
-	client = LoggingMiddleware(logger)(client)
+	client = LoggingMiddleware(k)(client)
 	// Wrap with UUID middleware after logger so that UUID is available in
 	// the logger context.
 	client = uuidMiddleware(client)
@@ -99,41 +99,35 @@ func NewGRPCClient(conn *grpc.ClientConn, logger log.Logger) KolideService {
 	return client
 }
 
-// dialGRPC creates a grpc client connection.
+// DialGRPC creates a grpc client connection.
 func DialGRPC(
-	serverURL string,
-	insecureTLS bool,
-	insecureTransport bool,
-	certPins [][]byte,
+	k types.Knapsack,
 	rootPool *x509.CertPool,
-	logger log.Logger,
 	opts ...grpc.DialOption, // Used for overrides in testing
 ) (*grpc.ClientConn, error) {
-	level.Info(logger).Log(
-		"msg", "dialing grpc server",
-		"server", serverURL,
-		"tls_secure", insecureTLS == false,
-		"transport_secure", insecureTransport == false,
-		"cert_pinning", len(certPins) > 0,
-	)
-	grpcOpts := []grpc.DialOption{
-		grpc.WithTimeout(time.Second),
-	}
-	if insecureTransport {
-		grpcOpts = append(grpcOpts, grpc.WithInsecure())
-	} else {
-		host, _, err := net.SplitHostPort(serverURL)
-		if err != nil {
-			return nil, fmt.Errorf("split grpc server host and port: %s: %w", serverURL, err)
-		}
 
-		creds := &tlsCreds{credentials.NewTLS(makeTLSConfig(host, insecureTLS, certPins, rootPool, logger))}
+	k.Slogger().Log(context.TODO(), slog.LevelDebug,
+		"dialing grpc server",
+		"server", k.KolideServerURL(),
+		"tls_secure", !k.InsecureTLS(),
+		"transport_secure", !k.InsecureTransportTLS(),
+		"cert_pinning", len(k.CertPins()) > 0,
+	)
+
+	grpcCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	grpcOpts := []grpc.DialOption{}
+	if k.InsecureTransportTLS() {
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		creds := &tlsCreds{credentials.NewTLS(makeTLSConfig(k, rootPool))}
 		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(creds))
 	}
 
 	grpcOpts = append(grpcOpts, opts...)
 
-	conn, err := grpc.Dial(serverURL, grpcOpts...)
+	conn, err := grpc.DialContext(grpcCtx, k.KolideServerURL(), grpcOpts...)
 	return conn, err
 }
 

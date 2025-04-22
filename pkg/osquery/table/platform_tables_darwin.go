@@ -4,26 +4,33 @@
 package table
 
 import (
-	"github.com/go-kit/kit/log"
+	"log/slog"
+
 	"github.com/knightsc/system_policy/osquery/table/kextpolicy"
 	"github.com/knightsc/system_policy/osquery/table/legacyexec"
-	"github.com/kolide/launcher/pkg/osquery/tables/airport"
-	appicons "github.com/kolide/launcher/pkg/osquery/tables/app-icons"
-	"github.com/kolide/launcher/pkg/osquery/tables/apple_silicon_security_policy"
-	"github.com/kolide/launcher/pkg/osquery/tables/dataflattentable"
-	"github.com/kolide/launcher/pkg/osquery/tables/execparsers/remotectl"
-	"github.com/kolide/launcher/pkg/osquery/tables/execparsers/softwareupdate"
-	"github.com/kolide/launcher/pkg/osquery/tables/filevault"
-	"github.com/kolide/launcher/pkg/osquery/tables/firmwarepasswd"
-	"github.com/kolide/launcher/pkg/osquery/tables/ioreg"
-	"github.com/kolide/launcher/pkg/osquery/tables/macos_software_update"
-	"github.com/kolide/launcher/pkg/osquery/tables/mdmclient"
-	"github.com/kolide/launcher/pkg/osquery/tables/munki"
-	"github.com/kolide/launcher/pkg/osquery/tables/osquery_user_exec_table"
-	"github.com/kolide/launcher/pkg/osquery/tables/profiles"
-	"github.com/kolide/launcher/pkg/osquery/tables/pwpolicy"
-	"github.com/kolide/launcher/pkg/osquery/tables/systemprofiler"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/allowedcmd"
+	"github.com/kolide/launcher/ee/tables/airport"
+	appicons "github.com/kolide/launcher/ee/tables/app-icons"
+	"github.com/kolide/launcher/ee/tables/apple_silicon_security_policy"
+	"github.com/kolide/launcher/ee/tables/dataflattentable"
+	"github.com/kolide/launcher/ee/tables/execparsers/remotectl"
+	"github.com/kolide/launcher/ee/tables/execparsers/repcli"
+	"github.com/kolide/launcher/ee/tables/execparsers/socketfilterfw"
+	"github.com/kolide/launcher/ee/tables/execparsers/softwareupdate"
+	"github.com/kolide/launcher/ee/tables/filevault"
+	"github.com/kolide/launcher/ee/tables/firmwarepasswd"
+	brew_upgradeable "github.com/kolide/launcher/ee/tables/homebrew"
+	"github.com/kolide/launcher/ee/tables/ioreg"
+	"github.com/kolide/launcher/ee/tables/macos_software_update"
+	"github.com/kolide/launcher/ee/tables/mdmclient"
+	"github.com/kolide/launcher/ee/tables/munki"
+	"github.com/kolide/launcher/ee/tables/osquery_user_exec_table"
+	"github.com/kolide/launcher/ee/tables/profiles"
+	"github.com/kolide/launcher/ee/tables/pwpolicy"
+	"github.com/kolide/launcher/ee/tables/spotlight"
+	"github.com/kolide/launcher/ee/tables/systemprofiler"
+	"github.com/kolide/launcher/ee/tables/zfs"
 	osquery "github.com/osquery/osquery-go"
 	"github.com/osquery/osquery-go/plugin/table"
 )
@@ -34,14 +41,14 @@ const (
 	screenlockQuery    = "select enabled, grace_period from screenlock"
 )
 
-func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, currentOsquerydBinaryPath string) []osquery.OsqueryPlugin {
+func platformSpecificTables(k types.Knapsack, slogger *slog.Logger, currentOsquerydBinaryPath string) []osquery.OsqueryPlugin {
 	munki := munki.New()
 
 	// This table uses undocumented APIs, There is some discussion at the
 	// PR adding the table. See
 	// https://github.com/osquery/osquery/pull/6243
 	screenlockTable := osquery_user_exec_table.TablePlugin(
-		client, logger, "kolide_screenlock",
+		k, slogger, "kolide_screenlock",
 		currentOsquerydBinaryPath, screenlockQuery,
 		[]table.ColumnDefinition{
 			table.IntegerColumn("enabled"),
@@ -49,7 +56,7 @@ func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, c
 		})
 
 	keychainAclsTable := osquery_user_exec_table.TablePlugin(
-		client, logger, "kolide_keychain_acls",
+		k, slogger, "kolide_keychain_acls",
 		currentOsquerydBinaryPath, keychainItemsQuery,
 		[]table.ColumnDefinition{
 			table.TextColumn("keychain_path"),
@@ -60,7 +67,7 @@ func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, c
 		})
 
 	keychainItemsTable := osquery_user_exec_table.TablePlugin(
-		client, logger, "kolide_keychain_items",
+		k, slogger, "kolide_keychain_items",
 		currentOsquerydBinaryPath, keychainAclsQuery,
 		[]table.ColumnDefinition{
 			table.TextColumn("label"),
@@ -75,49 +82,54 @@ func platformTables(client *osquery.ExtensionManagerClient, logger log.Logger, c
 	return []osquery.OsqueryPlugin{
 		keychainAclsTable,
 		keychainItemsTable,
-		Airdrop(client),
-		appicons.AppIcons(),
-		ChromeLoginKeychainInfo(client, logger),
-		firmwarepasswd.TablePlugin(client, logger),
-		GDriveSyncConfig(client, logger),
-		GDriveSyncHistoryInfo(client, logger),
-		KolideVulnerabilities(client, logger),
-		MDMInfo(logger),
-		macos_software_update.MacOSUpdate(client),
-		macos_software_update.RecommendedUpdates(logger),
-		macos_software_update.AvailableProducts(logger),
-		MachoInfo(),
-		Spotlight(),
-		TouchIDUserConfig(client, logger),
-		TouchIDSystemConfig(client, logger),
-		UserAvatar(logger),
-		ioreg.TablePlugin(client, logger),
-		profiles.TablePlugin(client, logger),
-		airport.TablePlugin(client, logger),
+		appicons.AppIcons(k, slogger),
+		brew_upgradeable.TablePlugin(k, slogger),
+		ChromeLoginKeychainInfo(k, slogger),
+		firmwarepasswd.TablePlugin(k, slogger),
+		GDriveSyncConfig(k, slogger),
+		GDriveSyncHistoryInfo(k, slogger),
+		MDMInfo(k, slogger),
+		macos_software_update.MacOSUpdate(k, slogger),
+		macos_software_update.RecommendedUpdates(k, slogger),
+		macos_software_update.AvailableProducts(k, slogger),
+		MachoInfo(k, slogger),
+		spotlight.TablePlugin(k, slogger),
+		TouchIDUserConfig(k, slogger),
+		TouchIDSystemConfig(k, slogger),
+		UserAvatar(k, slogger),
+		ioreg.TablePlugin(k, slogger),
+		profiles.TablePlugin(k, slogger),
+		airport.TablePlugin(k, slogger),
 		kextpolicy.TablePlugin(),
-		filevault.TablePlugin(client, logger),
-		mdmclient.TablePlugin(client, logger),
-		apple_silicon_security_policy.TablePlugin(logger),
+		filevault.TablePlugin(k, slogger),
+		mdmclient.TablePlugin(k, slogger),
+		apple_silicon_security_policy.TablePlugin(k, slogger),
 		legacyexec.TablePlugin(),
-		dataflattentable.TablePluginExec(client, logger,
-			"kolide_diskutil_list", dataflattentable.PlistType, []string{"/usr/sbin/diskutil", "list", "-plist"}),
-		dataflattentable.TablePluginExec(client, logger,
-			"kolide_falconctl_stats", dataflattentable.PlistType, []string{"/Applications/Falcon.app/Contents/Resources/falconctl", "stats", "-p"}),
-		dataflattentable.TablePluginExec(client, logger,
-			"kolide_apfs_list", dataflattentable.PlistType, []string{"/usr/sbin/diskutil", "apfs", "list", "-plist"}),
-		dataflattentable.TablePluginExec(client, logger,
-			"kolide_apfs_users", dataflattentable.PlistType, []string{"/usr/sbin/diskutil", "apfs", "listUsers", "/", "-plist"}),
-		dataflattentable.TablePluginExec(client, logger,
-			"kolide_tmutil_destinationinfo", dataflattentable.PlistType, []string{"/usr/bin/tmutil", "destinationinfo", "-X"}),
-		dataflattentable.TablePluginExec(client, logger,
-			"kolide_powermetrics", dataflattentable.PlistType, []string{"/usr/bin/powermetrics", "-n", "1", "-f", "plist"}),
+		dataflattentable.TablePluginExec(k, slogger,
+			"kolide_diskutil_list", dataflattentable.PlistType, allowedcmd.Diskutil, []string{"list", "-plist"}),
+		dataflattentable.TablePluginExec(k, slogger,
+			"kolide_falconctl_stats", dataflattentable.PlistType, allowedcmd.Launcher, []string{"rundisclaimed", "falconctl", "stats", "-p"}),
+		dataflattentable.TablePluginExec(k, slogger,
+			"kolide_apfs_list", dataflattentable.PlistType, allowedcmd.Diskutil, []string{"apfs", "list", "-plist"}),
+		dataflattentable.TablePluginExec(k, slogger,
+			"kolide_apfs_users", dataflattentable.PlistType, allowedcmd.Diskutil, []string{"apfs", "listUsers", "/", "-plist"}),
+		dataflattentable.TablePluginExec(k, slogger,
+			"kolide_tmutil_destinationinfo", dataflattentable.PlistType, allowedcmd.Tmutil, []string{"destinationinfo", "-X"}),
+		dataflattentable.TablePluginExec(k, slogger,
+			"kolide_powermetrics", dataflattentable.PlistType, allowedcmd.Powermetrics, []string{"-n", "1", "-f", "plist"}),
 		screenlockTable,
-		pwpolicy.TablePlugin(client, logger),
-		systemprofiler.TablePlugin(client, logger),
-		munki.ManagedInstalls(client, logger),
-		munki.MunkiReport(client, logger),
-		dataflattentable.NewExecAndParseTable(logger, "kolide_remotectl", remotectl.Parser, []string{`/usr/libexec/remotectl`, `dumpstate`}),
-		dataflattentable.NewExecAndParseTable(logger, "kolide_softwareupdate", softwareupdate.Parser, []string{`/usr/sbin/softwareupdate`, `--list`, `--no-scan`}, dataflattentable.WithIncludeStderr()),
-		dataflattentable.NewExecAndParseTable(logger, "kolide_softwareupdate_scan", softwareupdate.Parser, []string{`/usr/sbin/softwareupdate`, `--list`}, dataflattentable.WithIncludeStderr()),
+		pwpolicy.TablePlugin(k, slogger),
+		systemprofiler.TablePlugin(k, slogger),
+		munki.ManagedInstalls(k, slogger),
+		munki.MunkiReport(k, slogger),
+		dataflattentable.TablePluginExec(k, slogger, "kolide_nix_upgradeable", dataflattentable.XmlType, allowedcmd.NixEnv, []string{"--query", "--installed", "-c", "--xml"}),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_remotectl", remotectl.Parser, allowedcmd.Remotectl, []string{`dumpstate`}),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_socketfilterfw", socketfilterfw.Parser, allowedcmd.Socketfilterfw, []string{"--getglobalstate", "--getblockall", "--getallowsigned", "--getstealthmode"}, dataflattentable.WithIncludeStderr()),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_socketfilterfw_apps", socketfilterfw.Parser, allowedcmd.Socketfilterfw, []string{"--listapps"}, dataflattentable.WithIncludeStderr()),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_softwareupdate", softwareupdate.Parser, allowedcmd.Softwareupdate, []string{`--list`, `--no-scan`}, dataflattentable.WithIncludeStderr()),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_softwareupdate_scan", softwareupdate.Parser, allowedcmd.Softwareupdate, []string{`--list`}, dataflattentable.WithIncludeStderr()),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_carbonblack_repcli_status", repcli.Parser, allowedcmd.Launcher, []string{"rundisclaimed", "carbonblack_repcli", "status"}),
+		zfs.ZfsPropertiesPlugin(k, slogger),
+		zfs.ZpoolPropertiesPlugin(k, slogger),
 	}
 }

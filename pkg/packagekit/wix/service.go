@@ -16,21 +16,21 @@ type YesNoType string
 
 const (
 	Yes YesNoType = "yes"
-	No            = "no"
+	No  YesNoType = "no"
 )
 
 type ErrorControlType string
 
 const (
 	ErrorControlIgnore   ErrorControlType = "ignore"
-	ErrorControlNormal                    = "normal"
-	ErrorControlCritical                  = "critical"
+	ErrorControlNormal   ErrorControlType = "normal"
+	ErrorControlCritical ErrorControlType = "critical"
 )
 
 type StartType string
 
 const (
-	StartAuto     StartType = "auto"
+	StartAuto     StartType = "auto" // nolint:staticcheck // TODO FIXME
 	StartDemand             = "demand"
 	StartDisabled           = "disabled"
 	StartBoot               = "boot"
@@ -42,8 +42,8 @@ type InstallUninstallType string
 
 const (
 	InstallUninstallInstall   InstallUninstallType = "install"
-	InstallUninstallUninstall                      = "uninstall"
-	InstallUninstallBoth                           = "both"
+	InstallUninstallUninstall InstallUninstallType = "uninstall"
+	InstallUninstallBoth      InstallUninstallType = "both"
 )
 
 // ServiceInstall implements http://wixtoolset.org/documentation/manual/v3/xsd/wix/serviceinstall.html
@@ -64,6 +64,14 @@ type ServiceInstall struct {
 	Vital             YesNoType          `xml:",attr,omitempty"` // The overall install should fail if this service fails to install
 	UtilServiceConfig *UtilServiceConfig `xml:",omitempty"`
 	ServiceConfig     *ServiceConfig     `xml:",omitempty"`
+	ServiceDependency *ServiceDependency `xml:",omitempty"`
+}
+
+// ServiceDependency implements
+// https://wixtoolset.org/docs/v3/xsd/wix/servicedependency/
+type ServiceDependency struct {
+	Id    string    `xml:",attr,omitempty"`
+	Group YesNoType `xml:",attr,omitempty"`
 }
 
 // ServiceControl implements
@@ -82,6 +90,12 @@ type ServiceControl struct {
 // This is used needed to set DelayedAutoStart
 type ServiceConfig struct {
 	// TODO: this should need a namespace, and yet. See https://github.com/golang/go/issues/36813
+
+	// Id will be automaticlly set to the parent ServiceName attribute if not set.
+	// This will result in an error from wix if there are multiple services with the same name
+	// that occurs when we are creating an MSI with both arm64 and amd64 binaries.
+	// So we set Id in the heat post processing step.
+	Id               string    `xml:",attr,omitempty"`
 	XMLName          xml.Name  `xml:"http://schemas.microsoft.com/wix/2006/wi ServiceConfig"`
 	DelayedAutoStart YesNoType `xml:",attr,omitempty"`
 	OnInstall        YesNoType `xml:",attr,omitempty"`
@@ -151,6 +165,15 @@ func WithDisabledService() ServiceOpt {
 	}
 }
 
+func WithServiceDependency(service string) ServiceOpt {
+	return func(s *Service) {
+		s.serviceInstall.ServiceDependency = &ServiceDependency{
+			Id:    service,
+			Group: No, // set to no since `service` is the name of a singular service and not a group of services
+		}
+	}
+}
+
 // ServiceArgs takes an array of args, wraps them in spaces, then
 // joins them into a string. Handling spaces in the arguments is a bit
 // gnarly. Some parts of windows use ` as an escape character, but
@@ -188,8 +211,9 @@ func NewService(matchString string, opts ...ServiceOpt) *Service {
 	}
 
 	serviceConfig := &ServiceConfig{
-		OnInstall:   Yes,
-		OnReinstall: Yes,
+		OnInstall:        Yes,
+		OnReinstall:      Yes,
+		DelayedAutoStart: No,
 	}
 
 	// If a service name is not specified, replace the .exe with a svc,
@@ -197,6 +221,7 @@ func NewService(matchString string, opts ...ServiceOpt) *Service {
 	// probably better to specific a ServiceName, but this might be an
 	// okay default.
 	defaultName := cleanServiceName(strings.TrimSuffix(matchString, ".exe") + ".svc")
+
 	si := &ServiceInstall{
 		Name:              defaultName,
 		Id:                defaultName,
@@ -219,8 +244,9 @@ func NewService(matchString string, opts ...ServiceOpt) *Service {
 	}
 
 	s := &Service{
-		matchString:    matchString,
-		expectedCount:  1,
+		matchString: matchString,
+		// one count for arm64, one for amd64
+		expectedCount:  2,
 		count:          0,
 		serviceInstall: si,
 		serviceControl: sc,
@@ -244,7 +270,7 @@ func (s *Service) Match(line string) (bool, error) {
 	}
 
 	if s.count > s.expectedCount {
-		return isMatch, fmt.Errorf("Too many matches. Have %d, expected %d. (on %s)", s.count, s.expectedCount, s.matchString)
+		return isMatch, fmt.Errorf("too many matches: have %d, expected %d (on %s)", s.count, s.expectedCount, s.matchString)
 	}
 
 	return isMatch, nil

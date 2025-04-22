@@ -19,10 +19,11 @@ func (p *PackageOptions) detectLauncherVersion(ctx context.Context) error {
 	logger := log.With(ctxlog.FromContext(ctx), "library", "detectLauncherVersion")
 	level.Debug(logger).Log("msg", "Attempting launcher autodetection")
 
-	launcherPath := p.launcherLocation(filepath.Join(p.packageRoot, p.binDir))
+	launcherPath := p.launcherLocation()
+
 	stdout, err := p.execOut(ctx, launcherPath, "-version")
 	if err != nil {
-		return fmt.Errorf("Failed to exec. Perhaps -- Can't autodetect while cross compiling. (%s): %w", stdout, err)
+		return fmt.Errorf("failed to exec -- possibly can't autodetect while cross compiling: out `%s`: %w", stdout, err)
 	}
 
 	stdoutSplit := strings.Split(stdout, "\n")
@@ -30,18 +31,16 @@ func (p *PackageOptions) detectLauncherVersion(ctx context.Context) error {
 	version := versionLine[len(versionLine)-1]
 
 	if version == "" {
-		return errors.New("Unable to parse launcher version.")
+		return errors.New("unable to parse launcher version")
 	}
 
-	// Windows only supports a W.X.Y.Z packaing string. So we need to format this down
-	if p.target.Platform == Windows {
-		level.Debug(logger).Log("msg", "reformating for windows", "origVersion", version)
-		version, err = formatVersion(version)
-		if err != nil {
-			return fmt.Errorf("formatting version: %w", err)
-		}
-		level.Debug(logger).Log("msg", "reformating for windows", "newVersion", version)
+	level.Debug(logger).Log("msg", "formatting version string for target platform", "origVersion", version, "platform", p.target.Platform)
+	version, err = formatVersion(version, p.target.Platform)
+
+	if err != nil {
+		return fmt.Errorf("formatting version: %w", err)
 	}
+	level.Debug(logger).Log("msg", "successfully formatted version string", "newVersion", version)
 
 	p.PackageVersion = version
 	return nil
@@ -50,24 +49,29 @@ func (p *PackageOptions) detectLauncherVersion(ctx context.Context) error {
 // launcherLocation returns the location of the launcher binary within `binDir`. For darwin,
 // it may be in an app bundle -- we check to see if the binary exists there first, and then
 // fall back to the common location if it doesn't.
-func (p *PackageOptions) launcherLocation(binDir string) string {
+func (p *PackageOptions) launcherLocation() string {
 	if p.target.Platform == Darwin {
 		// We want /usr/local/Kolide.app, not /usr/local/bin/Kolide.app, so we use Dir to strip out `bin`
-		appBundleBinaryPath := filepath.Join(filepath.Dir(binDir), "Kolide.app", "Contents", "MacOS", "launcher")
+		appBundleBinaryPath := filepath.Join(p.packageRoot, filepath.Dir(p.binDir), "Kolide.app", "Contents", "MacOS", "launcher")
 		if info, err := os.Stat(appBundleBinaryPath); err == nil && !info.IsDir() {
 			return appBundleBinaryPath
 		}
 	}
 
-	return filepath.Join(binDir, p.target.PlatformBinaryName("launcher"))
+	if p.target.Platform == Windows {
+		return filepath.Join(p.packageRoot, p.binDir, string(p.target.Arch), p.target.PlatformBinaryName("launcher"))
+	}
+
+	return filepath.Join(p.packageRoot, p.binDir, p.target.PlatformBinaryName("launcher"))
 }
 
-// formatVersion formats the version. This is specific to windows. It
-// may show up elsewhere later.
-//
-// Windows packages must confirm to W.X.Y.Z, so we convert our git
-// format to that.
-func formatVersion(rawVersion string) (string, error) {
+// formatVersion formats the version according to the packaging requirements of the target platform
+// currently, only windows and darwin platforms require modification
+func formatVersion(rawVersion string, platform PlatformFlavor) (string, error) {
+	if platform != Windows && platform != Darwin {
+		return rawVersion, nil
+	}
+
 	versionRegex, err := regexp.Compile(`^v?(\d+)\.(\d+)(?:\.(\d+))(?:-(\d+).*)?`)
 	if err != nil {
 		return "", fmt.Errorf("version regex: %w", err)
@@ -77,11 +81,11 @@ func formatVersion(rawVersion string) (string, error) {
 	matches := versionRegex.FindAllStringSubmatch(rawVersion, -1)
 
 	if len(matches) == 0 {
-		return "", fmt.Errorf("Version %s did not match expected format", rawVersion)
+		return "", fmt.Errorf("version %s did not match expected format", rawVersion)
 	}
 
 	if len(matches[0]) != 5 {
-		return "", fmt.Errorf("Something very wrong. Expected 5 subgroups got %d from string %s", len(matches), rawVersion)
+		return "", fmt.Errorf("something very wrong: expected 5 subgroups, got %d, from string %s", len(matches), rawVersion)
 	}
 
 	major := matches[0][1]
@@ -103,6 +107,16 @@ func formatVersion(rawVersion string) (string, error) {
 		commits = "0"
 	}
 
-	version := fmt.Sprintf("%s.%s.%s.%s", major, minor, patch, commits)
-	return version, nil
+	switch platform {
+	case Windows:
+		// Windows expects a <major>.<minor>.<patch>.<commit> packaging string
+		return fmt.Sprintf("%s.%s.%s.%s", major, minor, patch, commits), nil
+	case Darwin:
+		// Darwin expects a <major>.<minor>.<patch> packaging string
+		return fmt.Sprintf("%s.%s.%s", major, minor, patch), nil
+	case Linux:
+		return rawVersion, nil
+	default:
+		return "", fmt.Errorf("unsupported platform %v", platform)
+	}
 }

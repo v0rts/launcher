@@ -4,29 +4,28 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/rsa"
 	"crypto/tls"
 	_ "embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-	"github.com/kolide/krypto"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/kolide/krypto/pkg/echelper"
-	"github.com/kolide/launcher/pkg/agent"
-	"github.com/kolide/launcher/pkg/agent/types"
-	"github.com/kolide/launcher/pkg/backoff"
-	"github.com/kolide/launcher/pkg/osquery"
+	"github.com/kolide/launcher/ee/agent"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/gowrapper"
+	"github.com/kolide/launcher/pkg/traces"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/time/rate"
 )
 
 // Special Kolide Ports
-var portList = []int{
+var PortList = []int{
 	12519,
 	40978,
 	52115,
@@ -35,31 +34,23 @@ var portList = []int{
 	22322,
 }
 
-type controlService interface {
-	AccelerateRequestInterval(interval, duration time.Duration)
-}
-
 type Querier interface {
 	Query(query string) ([]map[string]string, error)
 }
 
 type localServer struct {
-	logger       log.Logger
+	slogger      *slog.Logger
+	knapsack     types.Knapsack
 	srv          *http.Server
 	identifiers  identifiers
 	limiter      *rate.Limiter
 	tlsCerts     []tls.Certificate
 	querier      Querier
 	kolideServer string
+	cancel       context.CancelFunc
 
-	myKey                 *rsa.PrivateKey
-	myLocalDbSigner       crypto.Signer
-	myLocalHardwareSigner crypto.Signer
-
-	serverKey   *rsa.PublicKey
-	serverEcKey *ecdsa.PublicKey
-
-	controlService controlService
+	myLocalDbSigner crypto.Signer
+	serverEcKey     *ecdsa.PublicKey
 }
 
 const (
@@ -67,31 +58,20 @@ const (
 	defaultRateBurst = 10
 )
 
-type LocalServerOption func(*localServer)
-
-func WithLogger(logger log.Logger) LocalServerOption {
-	return func(s *localServer) {
-		s.logger = log.With(logger, "component", "localserver")
-	}
+type presenceDetector interface {
+	DetectPresence(reason string, interval time.Duration) (time.Duration, error)
 }
 
-func WithControlService(cs controlService) LocalServerOption {
-	return func(s *localServer) {
-		s.controlService = cs
-	}
-}
+func New(ctx context.Context, k types.Knapsack, presenceDetector presenceDetector) (*localServer, error) {
+	_, span := traces.StartSpan(ctx)
+	defer span.End()
 
-func New(configStore types.Getter, kolideServer string, opts ...LocalServerOption) (*localServer, error) {
 	ls := &localServer{
-		logger:                log.NewNopLogger(),
-		limiter:               rate.NewLimiter(defaultRateLimit, defaultRateBurst),
-		kolideServer:          kolideServer,
-		myLocalDbSigner:       agent.LocalDbKeys(),
-		myLocalHardwareSigner: agent.HardwareKeys(),
-	}
-
-	for _, o := range opts {
-		o(ls)
+		slogger:         k.Slogger().With("component", "localserver"),
+		knapsack:        k,
+		limiter:         rate.NewLimiter(defaultRateLimit, defaultRateBurst),
+		kolideServer:    k.KolideServerURL(),
+		myLocalDbSigner: agent.LocalDbKeys(),
 	}
 
 	// TODO: As there may be things that adjust the keys during runtime, we need to persist that across
@@ -100,14 +80,15 @@ func New(configStore types.Getter, kolideServer string, opts ...LocalServerOptio
 		return nil, err
 	}
 
-	// Consider polling this on an interval, so we get updates.
-	privateKey, err := osquery.PrivateRSAKeyFromDB(configStore)
+	munemo, err := getMunemoFromEnrollSecret(k)
 	if err != nil {
-		return nil, fmt.Errorf("fetching private key: %w", err)
+		ls.slogger.Log(ctx, slog.LevelError,
+			"getting munemo from enroll secret, not fatal, continuing",
+			"err", err,
+		)
 	}
-	ls.myKey = privateKey
 
-	ecKryptoMiddleware := newKryptoEcMiddleware(ls.logger, ls.myLocalDbSigner, ls.myLocalHardwareSigner, *ls.serverEcKey)
+	ecKryptoMiddleware := newKryptoEcMiddleware(k.Slogger(), ls.myLocalDbSigner, *ls.serverEcKey, presenceDetector, munemo)
 	ecAuthedMux := http.NewServeMux()
 	ecAuthedMux.HandleFunc("/", http.NotFound)
 	ecAuthedMux.Handle("/acceleratecontrol", ls.requestAccelerateControlHandler())
@@ -129,6 +110,23 @@ func New(configStore types.Getter, kolideServer string, opts ...LocalServerOptio
 	// /v0/cmd left for transition period
 	mux.Handle("/v1/cmd", ecKryptoMiddleware.Wrap(ecAuthedMux))
 
+	trustedDt4aKeys, err := dt4aKeys()
+	if err != nil {
+		return nil, fmt.Errorf("loading dt4a keys %w", err)
+	}
+
+	dt4aAuthMiddleware := &dt4aAuthMiddleware{
+		counterPartyKeys: trustedDt4aKeys,
+		slogger:          k.Slogger().With("component", "dt4a_auth_middleware"),
+	}
+
+	// In the future, we will want to make this authenticated; for now, it is not authenticated.
+	// TODO: make this authenticated or remove
+	mux.Handle("/zta", ls.requestDt4aInfoHandler())
+
+	mux.Handle("/v3/dt4a", dt4aAuthMiddleware.Wrap(ls.requestDt4aInfoHandler()))
+	mux.Handle("/v3/accelerate", dt4aAuthMiddleware.Wrap(ls.requestDt4aAccelerationHandler()))
+
 	// uncomment to test without going through middleware
 	// for example:
 	// curl localhost:40978/query --data '{"query":"select * from kolide_launcher_info"}'
@@ -137,9 +135,19 @@ func New(configStore types.Getter, kolideServer string, opts ...LocalServerOptio
 	// mux.Handle("/scheduledquery", ls.requestScheduledQueryHandler())
 	// curl localhost:40978/acceleratecontrol  --data '{"interval":"250ms", "duration":"1s"}'
 	// mux.Handle("/acceleratecontrol", ls.requestAccelerateControlHandler())
+	// curl localhost:40978/id
+	// mux.Handle("/id", ls.requestIdHandler())
 
 	srv := &http.Server{
-		Handler:           ls.requestLoggingHandler(ls.preflightCorsHandler(ls.rateLimitHandler(mux))),
+		Handler: otelhttp.NewHandler(
+			ls.requestLoggingHandler(
+				ls.preflightCorsHandler(
+					ls.rateLimitHandler(
+						mux,
+					),
+				)), "localserver", otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
+				return r.URL.Path
+			})),
 		ReadTimeout:       500 * time.Millisecond,
 		ReadHeaderTimeout: 50 * time.Millisecond,
 		// WriteTimeout very high due to retry logic in the scheduledquery endpoint
@@ -157,41 +165,40 @@ func (ls *localServer) SetQuerier(querier Querier) {
 }
 
 func (ls *localServer) LoadDefaultKeyIfNotSet() error {
-	if ls.serverKey != nil {
+	if ls.serverEcKey != nil {
 		return nil
 	}
 
-	serverRsaCertPem := k2RsaServerCert
 	serverEccCertPem := k2EccServerCert
+
+	ctx := context.TODO()
+	slogLevel := slog.LevelDebug
+
 	switch {
 	case strings.HasPrefix(ls.kolideServer, "localhost"), strings.HasPrefix(ls.kolideServer, "127.0.0.1"), strings.Contains(ls.kolideServer, ".ngrok."):
-		level.Debug(ls.logger).Log("msg", "using developer certificates")
-		serverRsaCertPem = localhostRsaServerCert
+		ls.slogger.Log(ctx, slogLevel,
+			"using developer certificates",
+		)
+
 		serverEccCertPem = localhostEccServerCert
 	case strings.HasSuffix(ls.kolideServer, ".herokuapp.com"):
-		level.Debug(ls.logger).Log("msg", "using review app certificates")
-		serverRsaCertPem = reviewRsaServerCert
+		ls.slogger.Log(ctx, slogLevel,
+			"using review app certificates",
+		)
+
 		serverEccCertPem = reviewEccServerCert
 	default:
-		level.Debug(ls.logger).Log("msg", "using default/production certificates")
+		ls.slogger.Log(ctx, slogLevel,
+			"using default/production certificates",
+		)
 	}
 
-	serverKeyRaw, err := krypto.KeyFromPem([]byte(serverRsaCertPem))
-	if err != nil {
-		return fmt.Errorf("parsing default public key: %w", err)
-	}
-
-	serverKey, ok := serverKeyRaw.(*rsa.PublicKey)
-	if !ok {
-		return errors.New("public key not an rsa public key")
-	}
-
-	ls.serverKey = serverKey
-
-	ls.serverEcKey, err = echelper.PublicPemToEcdsaKey([]byte(serverEccCertPem))
+	serverEcKey, err := echelper.PublicPemToEcdsaKey([]byte(serverEccCertPem))
 	if err != nil {
 		return fmt.Errorf("parsing default server ec key: %w", err)
 	}
+
+	ls.serverEcKey = serverEcKey
 
 	return nil
 }
@@ -199,18 +206,21 @@ func (ls *localServer) LoadDefaultKeyIfNotSet() error {
 func (ls *localServer) runAsyncdWorkers() time.Time {
 	success := true
 
-	level.Debug(ls.logger).Log("msg", "Starting an async worker run")
+	ctx := context.TODO()
+	ls.slogger.Log(ctx, slog.LevelDebug,
+		"starting async worker run",
+	)
 
 	if err := ls.updateIdFields(); err != nil {
 		success = false
-		level.Info(ls.logger).Log(
-			"msg", "Got error updating id fields",
+		ls.slogger.Log(ctx, slog.LevelError,
+			"updating id fields",
 			"err", err,
 		)
 	}
 
-	level.Debug(ls.logger).Log(
-		"msg", "Completed async worker run",
+	ls.slogger.Log(ctx, slog.LevelDebug,
+		"completed async worker run",
 		"success", success,
 	)
 
@@ -220,66 +230,84 @@ func (ls *localServer) runAsyncdWorkers() time.Time {
 	return time.Now()
 }
 
-func (ls *localServer) Start() error {
-	// Spawn background workers. This loop is a bit weird on startup. We want to populate this data as soon as we can, but because the underlying launcher
-	// run group isn't ordered, this is likely to happen before querier is ready. So we retry at a frequent interval for a couple of minutes, then we drop
-	// back to a slower poll interval. Note that this polling is merely a check against time, we don't repopulate this data nearly so often. (But we poll
-	// frequently to account for the difference between wall clock time, and sleep time)
-	const (
-		initialPollInterval = 10 * time.Second
-		initialPollTimeout  = 2 * time.Minute
-		pollInterval        = 15 * time.Minute
-		recalculateInterval = 24 * time.Hour
-	)
-	go func() {
-		// Initial load, run pretty often, at least for the first chunk of time.
-		var lastRun time.Time
-		if err := backoff.WaitFor(func() error {
-			lastRun = ls.runAsyncdWorkers()
-			if (lastRun == time.Time{}) {
-				return errors.New("async tasks not success on initial boot (no surprise)")
-			}
-			return nil
-		},
-			initialPollTimeout,
-			initialPollInterval,
-		); err != nil {
-			level.Info(ls.logger).Log("message", "Initial async runs unsuccessful. Will retry in the future.", "err", err)
-		}
+var (
+	pollInterval        = 15 * time.Minute
+	recalculateInterval = 24 * time.Hour
+)
 
-		// Now that we're done with the initial population, fall back to a periodic polling
-		for range time.Tick(pollInterval) {
-			if time.Since(lastRun) > (recalculateInterval) {
-				lastRun = ls.runAsyncdWorkers()
+func (ls *localServer) Start() error {
+	// Spawn background workers. The information gathered here is not critical for DT flow- so to reduce early osquery contention
+	// we wait for <pollInterval> and before starting and then only rerun if the previous run was unsuccessful,
+	// or has been greater than <recalculateInterval>. Note that this polling is merely a check against time,
+	// we don't repopulate this data nearly so often. (But we poll frequently to account for the difference between
+	// wall clock time, and sleep time)
+
+	var ctx context.Context
+	ctx, ls.cancel = context.WithCancel(context.Background())
+
+	gowrapper.Go(ctx, ls.slogger, func() {
+		var lastRun time.Time
+
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+
+		// note that this will trigger the check for the first time after pollInterval (not immediately)
+		for {
+			select {
+			case <-ctx.Done():
+				ls.slogger.Log(ctx, slog.LevelDebug,
+					"runAsyncdWorkers received shutdown signal",
+				)
+				return
+			case <-ticker.C:
+				if time.Since(lastRun) > recalculateInterval {
+					lastRun = ls.runAsyncdWorkers()
+					if lastRun.IsZero() {
+						ls.slogger.Log(ctx, slog.LevelDebug,
+							"runAsyncdWorkers unsuccessful, will retry in the future",
+						)
+					}
+				}
 			}
 		}
-	}()
+	})
 
 	l, err := ls.startListener()
 	if err != nil {
 		return fmt.Errorf("starting listener: %w", err)
 	}
 
-	if ls.tlsCerts != nil && len(ls.tlsCerts) > 0 {
-		level.Debug(ls.logger).Log("message", "Using TLS")
+	if len(ls.tlsCerts) > 0 {
+		ls.slogger.Log(ctx, slog.LevelDebug,
+			"using TLS",
+		)
 
-		tlsConfig := &tls.Config{Certificates: ls.tlsCerts, InsecureSkipVerify: true} // lgtm[go/disabled-certificate-check]
+		tlsConfig := &tls.Config{Certificates: ls.tlsCerts}
 
 		l = tls.NewListener(l, tlsConfig)
 	} else {
-		level.Debug(ls.logger).Log("message", "No TLS")
+		ls.slogger.Log(ctx, slog.LevelDebug,
+			"not using TLS",
+		)
 	}
 
 	return ls.srv.Serve(l)
 }
 
 func (ls *localServer) Stop() error {
-	level.Debug(ls.logger).Log("msg", "Stopping")
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx := context.TODO()
+	ls.slogger.Log(ctx, slog.LevelDebug,
+		"stopping",
+	)
+
+	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 
 	if err := ls.srv.Shutdown(ctx); err != nil {
-		level.Info(ls.logger).Log("message", "got error shutting down", "error", err)
+		ls.slogger.Log(ctx, slog.LevelError,
+			"shutting down",
+			"err", err,
+		)
 	}
 
 	// Consider calling srv.Stop as a more forceful shutdown?
@@ -287,28 +315,47 @@ func (ls *localServer) Stop() error {
 	return nil
 }
 
-func (ls *localServer) Interrupt(err error) {
-	level.Debug(ls.logger).Log("message", "Stopping due to interrupt", "reason", err)
+func (ls *localServer) Interrupt(_ error) {
+	ctx := context.TODO()
+
+	ls.slogger.Log(ctx, slog.LevelDebug,
+		"stopping due to interrupt",
+	)
+
 	if err := ls.Stop(); err != nil {
-		level.Info(ls.logger).Log("message", "got error interrupting", "error", err)
+		ls.slogger.Log(ctx, slog.LevelError,
+			"stopping",
+			"err", err,
+		)
 	}
+
+	ls.cancel()
 }
 
 func (ls *localServer) startListener() (net.Listener, error) {
-	for _, p := range portList {
-		level.Debug(ls.logger).Log("msg", "Trying port", "port", p)
+	ctx := context.TODO()
+
+	for _, p := range PortList {
+		ls.slogger.Log(ctx, slog.LevelDebug,
+			"trying port",
+			"port", p,
+		)
 
 		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 		if err != nil {
-			level.Debug(ls.logger).Log(
-				"message", "Unable to bind to port. Moving on",
+			ls.slogger.Log(ctx, slog.LevelDebug,
+				"unable to bind to port, moving on",
 				"port", p,
 				"err", err,
 			)
+
 			continue
 		}
 
-		level.Info(ls.logger).Log("msg", "Got port", "port", p)
+		ls.slogger.Log(ctx, slog.LevelInfo,
+			"got port",
+			"port", p,
+		)
 		return l, nil
 	}
 
@@ -317,14 +364,24 @@ func (ls *localServer) startListener() (net.Listener, error) {
 
 func (ls *localServer) preflightCorsHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Think harder, maybe?
-		// https://stackoverflow.com/questions/12830095/setting-http-headers
+		// We don't believe we can meaningfully enforce a CORS style check here -- those are enforced by the browser.
+		// And we recognize there are some patterns that bypass the browsers CORS enforcement. However, we do implement
+		// origin enforcement as an allowlist inside kryptoEcMiddleware
+		// See https://github.com/kolide/k2/issues/9634
 		if origin := r.Header.Get("Origin"); origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 		w.Header().Set("Access-Control-Allow-Headers",
 			"Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+
+		// We need this for device trust to work in newer versions of Chrome with experimental features toggled on
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		// Some modern chrome and derivatives use Access-Control-Allow-Private-Network
+		// https://developer.chrome.com/blog/private-network-access-preflight/
+		// Though it's unclear if this is still needed, see https://developer.chrome.com/blog/private-network-access-update/
+		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 
 		// Stop here if its Preflighted OPTIONS request
 		if r.Method == "OPTIONS" {
@@ -337,9 +394,13 @@ func (ls *localServer) preflightCorsHandler(next http.Handler) http.Handler {
 
 func (ls *localServer) rateLimitHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if ls.limiter.Allow() == false {
-			http.Error(w, http.StatusText(429), http.StatusTooManyRequests)
-			level.Error(ls.logger).Log("msg", "Over rate limit")
+		if !ls.limiter.Allow() {
+			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+
+			ls.slogger.Log(r.Context(), slog.LevelError,
+				"over rate limit",
+			)
+
 			return
 		}
 
@@ -347,11 +408,34 @@ func (ls *localServer) rateLimitHandler(next http.Handler) http.Handler {
 	})
 }
 
-func (ls *localServer) kryptoBoxOutboundHandler(http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	})
-}
+// getMunemoFromEnrollSecret extracts the munemo from the enroll secret
+func getMunemoFromEnrollSecret(k types.Knapsack) (string, error) {
+	enrollSecret, err := k.ReadEnrollSecret()
+	if err != nil {
+		return "", err
+	}
 
-func (ls *localServer) verify(message []byte, sig []byte) error {
-	return krypto.RsaVerify(ls.serverKey, message, sig)
+	// We do not have the key, and thus CANNOT verify. So this is ParseUnverified
+	token, _, err := new(jwt.Parser).ParseUnverified(enrollSecret, jwt.MapClaims{})
+	if err != nil {
+		return "", err
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", errors.New("invalid token claims")
+	}
+
+	org, ok := claims["organization"]
+	if !ok {
+		return "", errors.New("no organization claim")
+	}
+
+	// convert org to string
+	munemo, ok := org.(string)
+	if !ok {
+		return "", errors.New("organization claim not a string")
+	}
+
+	return munemo, nil
 }

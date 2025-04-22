@@ -4,15 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/go-kit/kit/endpoint"
-	"github.com/go-kit/kit/log/level"
 	"github.com/go-kit/kit/transport/http/jsonrpc"
 	"github.com/kolide/kit/contexts/uuid"
-	"github.com/osquery/osquery-go/plugin/distributed"
-
 	pb "github.com/kolide/launcher/pkg/pb/launcher"
+	"github.com/kolide/launcher/pkg/traces"
+	"github.com/osquery/osquery-go/plugin/distributed"
 )
 
 type resultCollection struct {
@@ -21,6 +21,7 @@ type resultCollection struct {
 }
 
 type publishResultsResponse struct {
+	jsonRpcResponse
 	Message     string `json:"message"`
 	NodeInvalid bool   `json:"node_invalid"`
 	ErrorCode   string `json:"error_code,omitempty"`
@@ -118,6 +119,9 @@ func encodeGRPCResultCollection(_ context.Context, request interface{}) (interfa
 func decodeGRPCPublishResultsResponse(_ context.Context, grpcReq interface{}) (interface{}, error) {
 	req := grpcReq.(*pb.AgentApiResponse)
 	return publishResultsResponse{
+		jsonRpcResponse: jsonRpcResponse{
+			DisableDevice: req.DisableDevice,
+		},
 		Message:     req.Message,
 		ErrorCode:   req.ErrorCode,
 		NodeInvalid: req.NodeInvalid,
@@ -127,9 +131,10 @@ func decodeGRPCPublishResultsResponse(_ context.Context, grpcReq interface{}) (i
 func encodeGRPCPublishResultsResponse(_ context.Context, request interface{}) (interface{}, error) {
 	req := request.(publishResultsResponse)
 	resp := &pb.AgentApiResponse{
-		Message:     req.Message,
-		ErrorCode:   req.ErrorCode,
-		NodeInvalid: req.NodeInvalid,
+		Message:       req.Message,
+		ErrorCode:     req.ErrorCode,
+		NodeInvalid:   req.NodeInvalid,
+		DisableDevice: req.DisableDevice,
 	}
 	return encodeResponse(resp, req.Err)
 }
@@ -137,7 +142,7 @@ func encodeGRPCPublishResultsResponse(_ context.Context, request interface{}) (i
 func encodeJSONRPCPublishResultsResponse(_ context.Context, obj interface{}) (json.RawMessage, error) {
 	res, ok := obj.(publishResultsResponse)
 	if !ok {
-		return encodeJSONResponse(nil, fmt.Errorf("Asserting result to *publishResultsResponse failed. Got %T, %+v", obj, obj))
+		return encodeJSONResponse(nil, fmt.Errorf("asserting result to *publishResultsResponse failed. Got %T, %+v", obj, obj))
 	}
 
 	b, err := json.Marshal(res)
@@ -159,6 +164,9 @@ func MakePublishResultsEndpoint(svc KolideService) endpoint.Endpoint {
 
 // PublishResults implements KolideService.PublishResults
 func (e Endpoints) PublishResults(ctx context.Context, nodeKey string, results []distributed.Result) (string, string, bool, error) {
+	ctx, span := traces.StartSpan(ctx)
+	defer span.End()
+
 	newCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
@@ -168,6 +176,11 @@ func (e Endpoints) PublishResults(ctx context.Context, nodeKey string, results [
 		return "", "", false, err
 	}
 	resp := response.(publishResultsResponse)
+
+	if resp.DisableDevice {
+		return "", "", false, ErrDeviceDisabled{}
+	}
+
 	return resp.Message, resp.ErrorCode, resp.NodeInvalid, resp.Err
 }
 
@@ -182,21 +195,45 @@ func (s *grpcServer) PublishResults(ctx context.Context, req *pb.ResultCollectio
 func (mw logmw) PublishResults(ctx context.Context, nodeKey string, results []distributed.Result) (message, errcode string, reauth bool, err error) {
 	defer func(begin time.Time) {
 		resJSON, _ := json.Marshal(results)
+
 		uuid, _ := uuid.FromContext(ctx)
-		logger := level.Debug(mw.logger)
-		if err != nil {
-			logger = level.Info(mw.logger)
+
+		if message == "" {
+			if err == nil {
+				message = "success"
+			} else {
+				message = "failure"
+			}
 		}
-		logger.Log(
+
+		mw.knapsack.Slogger().Log(ctx, levelForError(err), message, // nolint:sloglint // it's fine to not have a constant or literal here
 			"method", "PublishResults",
 			"uuid", uuid,
-			"results", string(resJSON),
-			"message", message,
+			"results_truncated", trivialTruncate(string(resJSON), 200),
+			"result_count", len(results),
+			"result_size", len(resJSON),
 			"errcode", errcode,
 			"reauth", reauth,
 			"err", err,
 			"took", time.Since(begin),
 		)
+
+		for _, r := range results {
+			if r.QueryStats == nil {
+				continue
+			}
+
+			mw.knapsack.Slogger().Log(ctx, slog.LevelInfo,
+				"received distributed query stats",
+				"query_name", r.QueryName,
+				"query_status", r.Status,
+				"wall_time_ms", r.QueryStats.WallTimeMs,
+				"user_time", r.QueryStats.UserTime,
+				"system_time", r.QueryStats.SystemTime,
+				"memory", r.QueryStats.Memory,
+				"long_running", r.QueryStats.WallTimeMs > 5000,
+			)
+		}
 	}(time.Now())
 
 	message, errcode, reauth, err = mw.next.PublishResults(ctx, nodeKey, results)
@@ -206,4 +243,16 @@ func (mw logmw) PublishResults(ctx context.Context, nodeKey string, results []di
 func (mw uuidmw) PublishResults(ctx context.Context, nodeKey string, results []distributed.Result) (message, errcode string, reauth bool, err error) {
 	ctx = uuid.NewContext(ctx, uuid.NewForRequest())
 	return mw.next.PublishResults(ctx, nodeKey, results)
+}
+
+// trivialTruncate performs a trivial truncate operation on strings. Because it's string based, it may not handle
+// multibyte characters correctly. Note that this actually returns a string length of maxLen +3, but that's okay
+// because it's only used to keep logs from being too huge.
+func trivialTruncate(str string, maxLen int) string {
+	if len(str) <= maxLen {
+		return str
+	}
+
+	return str[:maxLen] + "..."
+
 }

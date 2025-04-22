@@ -7,12 +7,18 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/endpoint"
-	"github.com/go-kit/kit/log/level"
 	"github.com/go-kit/kit/transport/http/jsonrpc"
 	"github.com/kolide/kit/contexts/uuid"
 	"github.com/osquery/osquery-go/plugin/logger"
 
 	pb "github.com/kolide/launcher/pkg/pb/launcher"
+)
+
+type contextKey string
+
+const (
+	// PublicationCtxKey is used to set the relevant thresholds in context for reporting when logs are published
+	PublicationCtxKey contextKey = "log_publication_state"
 )
 
 type logCollection struct {
@@ -22,6 +28,7 @@ type logCollection struct {
 }
 
 type publishLogsResponse struct {
+	jsonRpcResponse
 	Message     string `json:"message"`
 	NodeInvalid bool   `json:"node_invalid"`
 	ErrorCode   string `json:"error_code,omitempty"`
@@ -40,13 +47,13 @@ func decodeGRPCLogCollection(_ context.Context, grpcReq interface{}) (interface{
 	// For now this should be enough because we don't use the Agent LogType anywhere.
 	// A more robust fix should come from fixing https://github.com/kolide/launcher/issues/183
 	var typ logger.LogType
-	switch req.LogType {
+	switch req.LogType { //nolint:exhaustive // This code is old and not in use
 	case pb.LogCollection_STATUS:
 		typ = logger.LogTypeStatus
 	case pb.LogCollection_RESULT:
 		typ = logger.LogTypeSnapshot
 	default:
-		panic(fmt.Sprintf("logType %d not implemented", req.LogType))
+		return logCollection{}, fmt.Errorf("unsupported log type %d", req.LogType)
 	}
 
 	return logCollection{
@@ -76,7 +83,7 @@ func encodeGRPCLogCollection(_ context.Context, request interface{}) (interface{
 	}
 
 	var typ pb.LogCollection_LogType
-	switch req.LogType {
+	switch req.LogType { //nolint:exhaustive // This code is old and not in use
 	case logger.LogTypeStatus:
 		typ = pb.LogCollection_STATUS
 	case logger.LogTypeString, logger.LogTypeSnapshot:
@@ -95,6 +102,9 @@ func encodeGRPCLogCollection(_ context.Context, request interface{}) (interface{
 func decodeGRPCPublishLogsResponse(_ context.Context, grpcReq interface{}) (interface{}, error) {
 	req := grpcReq.(*pb.AgentApiResponse)
 	return publishLogsResponse{
+		jsonRpcResponse: jsonRpcResponse{
+			DisableDevice: req.DisableDevice,
+		},
 		Message:     req.Message,
 		ErrorCode:   req.ErrorCode,
 		NodeInvalid: req.NodeInvalid,
@@ -104,9 +114,10 @@ func decodeGRPCPublishLogsResponse(_ context.Context, grpcReq interface{}) (inte
 func encodeGRPCPublishLogsResponse(_ context.Context, request interface{}) (interface{}, error) {
 	req := request.(publishLogsResponse)
 	resp := &pb.AgentApiResponse{
-		Message:     req.Message,
-		ErrorCode:   req.ErrorCode,
-		NodeInvalid: req.NodeInvalid,
+		Message:       req.Message,
+		ErrorCode:     req.ErrorCode,
+		NodeInvalid:   req.NodeInvalid,
+		DisableDevice: req.DisableDevice,
 	}
 	return encodeResponse(resp, req.Err)
 }
@@ -114,7 +125,7 @@ func encodeGRPCPublishLogsResponse(_ context.Context, request interface{}) (inte
 func encodeJSONRPCPublishLogsResponse(_ context.Context, obj interface{}) (json.RawMessage, error) {
 	res, ok := obj.(publishLogsResponse)
 	if !ok {
-		return encodeJSONResponse(nil, fmt.Errorf("Asserting result to *publishLogsResponse failed. Got %T, %+v", obj, obj))
+		return encodeJSONResponse(nil, fmt.Errorf("asserting result to *publishLogsResponse failed. Got %T, %+v", obj, obj))
 	}
 
 	b, err := json.Marshal(res)
@@ -157,6 +168,11 @@ func (e Endpoints) PublishLogs(ctx context.Context, nodeKey string, logType logg
 		return "", "", false, err
 	}
 	resp := response.(publishLogsResponse)
+
+	if resp.DisableDevice {
+		return "", "", false, ErrDeviceDisabled{}
+	}
+
 	return resp.Message, resp.ErrorCode, resp.NodeInvalid, resp.Err
 }
 
@@ -171,20 +187,30 @@ func (s *grpcServer) PublishLogs(ctx context.Context, req *pb.LogCollection) (*p
 func (mw logmw) PublishLogs(ctx context.Context, nodeKey string, logType logger.LogType, logs []string) (message, errcode string, reauth bool, err error) {
 	defer func(begin time.Time) {
 		uuid, _ := uuid.FromContext(ctx)
-		logger := level.Debug(mw.logger)
-		if err != nil {
-			logger = level.Info(mw.logger)
+
+		if message == "" {
+			if err == nil {
+				message = "success"
+			} else {
+				message = "failure"
+			}
 		}
-		logger.Log(
+
+		pubStateVals, ok := ctx.Value(PublicationCtxKey).(map[string]int)
+		if !ok {
+			pubStateVals = make(map[string]int)
+		}
+
+		mw.knapsack.Slogger().Log(ctx, levelForError(err), message, // nolint:sloglint // it's fine to not have a constant or literal here
 			"method", "PublishLogs",
 			"uuid", uuid,
 			"logType", logType,
 			"log_count", len(logs),
-			"message", message,
 			"errcode", errcode,
 			"reauth", reauth,
 			"err", err,
 			"took", time.Since(begin),
+			"publication_state", pubStateVals,
 		)
 	}(time.Now())
 

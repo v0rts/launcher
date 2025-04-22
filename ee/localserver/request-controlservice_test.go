@@ -7,19 +7,33 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kolide/launcher/ee/localserver/mocks"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/agent/types/mocks"
+	"github.com/kolide/launcher/pkg/log/multislogger"
+
 	"github.com/stretchr/testify/require"
 )
 
 func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 	t.Parallel()
 
+	slogger := multislogger.NewNopLogger()
+
+	defaultMockKnapsack := func() types.Knapsack {
+		m := mocks.NewKnapsack(t)
+		m.On("KolideServerURL").Return("localhost")
+		m.On("Slogger").Return(slogger)
+		m.On("ReadEnrollSecret").Return("enroll_secret", nil)
+		return m
+	}
+
 	tests := []struct {
 		name                  string
 		expectedHttpStatus    int
+		expectedInterval      time.Duration
 		body                  map[string]string
 		httpErrStr, logErrStr string
-		mockControlService    func() controlService
+		mockKnapsack          func() types.Knapsack
 	}{
 		{
 			name:               "happy path",
@@ -28,9 +42,14 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 				"interval": "250ms",
 				"duration": "1s",
 			},
-			mockControlService: func() controlService {
-				m := mocks.NewControlService(t)
-				m.On("AccelerateRequestInterval", 250*time.Millisecond, 1*time.Second)
+			expectedInterval: 250 * time.Millisecond,
+			mockKnapsack: func() types.Knapsack {
+				m := mocks.NewKnapsack(t)
+				m.On("KolideServerURL").Return("localhost")
+				m.On("SetControlRequestIntervalOverride", 250*time.Millisecond, 1*time.Second)
+				m.On("SetDistributedForwardingIntervalOverride", 250*time.Millisecond, 1*time.Second)
+				m.On("Slogger").Return(slogger)
+				m.On("ReadEnrollSecret").Return("enroll_secret", nil)
 				return m
 			},
 		},
@@ -38,12 +57,7 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 			name:               "no body",
 			expectedHttpStatus: http.StatusBadRequest,
 			httpErrStr:         "request body is nil",
-		},
-		{
-			name:               "no control service",
-			expectedHttpStatus: http.StatusBadRequest,
-			httpErrStr:         "control service not configured",
-			body:               map[string]string{},
+			mockKnapsack:       defaultMockKnapsack,
 		},
 		{
 			name:               "bad interval",
@@ -52,8 +66,8 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 				"interval": "blah",
 				"duration": "1s",
 			},
-			mockControlService: func() controlService { return mocks.NewControlService(t) },
-			httpErrStr:         "error parsing interval",
+			httpErrStr:   "error parsing interval",
+			mockKnapsack: defaultMockKnapsack,
 		},
 		{
 			name:               "empty interval",
@@ -62,8 +76,8 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 				"interval": "",
 				"duration": "1s",
 			},
-			mockControlService: func() controlService { return mocks.NewControlService(t) },
-			httpErrStr:         "error parsing interval",
+			httpErrStr:   "error parsing interval",
+			mockKnapsack: defaultMockKnapsack,
 		},
 		{
 			name:               "no interval",
@@ -71,8 +85,8 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 			body: map[string]string{
 				"duration": "1s",
 			},
-			mockControlService: func() controlService { return mocks.NewControlService(t) },
-			httpErrStr:         "error parsing interval",
+			httpErrStr:   "error parsing interval",
+			mockKnapsack: defaultMockKnapsack,
 		},
 		{
 			name:               "bad duration",
@@ -81,8 +95,8 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 				"interval": "250ms",
 				"duration": "blah",
 			},
-			mockControlService: func() controlService { return mocks.NewControlService(t) },
-			httpErrStr:         "error parsing duration",
+			httpErrStr:   "error parsing duration",
+			mockKnapsack: defaultMockKnapsack,
 		},
 		{
 			name:               "empty duration",
@@ -91,8 +105,8 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 				"interval": "250ms",
 				"duration": "",
 			},
-			mockControlService: func() controlService { return mocks.NewControlService(t) },
-			httpErrStr:         "error parsing duration",
+			httpErrStr:   "error parsing duration",
+			mockKnapsack: defaultMockKnapsack,
 		},
 		{
 			name:               "no duration",
@@ -100,8 +114,8 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 			body: map[string]string{
 				"interval": "250ms",
 			},
-			mockControlService: func() controlService { return mocks.NewControlService(t) },
-			httpErrStr:         "error parsing duration",
+			httpErrStr:   "error parsing duration",
+			mockKnapsack: defaultMockKnapsack,
 		},
 	}
 
@@ -110,12 +124,13 @@ func Test_localServer_requestAccelerateControlFunc(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			var logBytes bytes.Buffer
-			server := testServer(t, &logBytes)
-
-			if tt.mockControlService != nil {
-				server.controlService = tt.mockControlService()
+			var k types.Knapsack
+			if tt.mockKnapsack != nil {
+				k = tt.mockKnapsack()
 			}
+
+			var logBytes bytes.Buffer
+			server := testServer(t, k)
 
 			req, err := http.NewRequest("", "", nil)
 			if tt.body != nil {

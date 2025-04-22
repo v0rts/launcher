@@ -3,7 +3,6 @@
 //
 // It is originally from
 // https://github.com/ceshihao/windowsupdate/blob/master/oleconv.go
-
 package oleconv
 
 import (
@@ -15,7 +14,7 @@ import (
 
 func okToErr(ok bool, t string) error {
 	if !ok {
-		return fmt.Errorf("Not a %s", t)
+		return fmt.Errorf("not a %s", t)
 	}
 	return nil
 }

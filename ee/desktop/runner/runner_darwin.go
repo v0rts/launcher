@@ -8,10 +8,16 @@ import (
 	"fmt"
 	"os/exec"
 	"os/user"
+
+	"github.com/kolide/launcher/pkg/traces"
+	"golang.org/x/sys/unix"
 )
 
 // For notifications to work, we must run in the user context with launchctl asuser.
-func (r *DesktopUsersProcessesRunner) runAsUser(_ context.Context, uid string, cmd *exec.Cmd) error {
+func (r *DesktopUsersProcessesRunner) runAsUser(ctx context.Context, uid string, cmd *exec.Cmd) error {
+	_, span := traces.StartSpan(ctx, "uid", uid)
+	defer span.End()
+
 	// Ensure that we handle a non-root current user appropriately
 	currentUser, err := user.Current()
 	if err != nil {
@@ -19,7 +25,7 @@ func (r *DesktopUsersProcessesRunner) runAsUser(_ context.Context, uid string, c
 	}
 
 	runningUser, err := user.LookupId(uid)
-	if err != nil {
+	if err != nil || runningUser == nil {
 		return fmt.Errorf("looking up user with uid %s: %w", uid, err)
 	}
 
@@ -49,4 +55,13 @@ func (r *DesktopUsersProcessesRunner) runAsUser(_ context.Context, uid string, c
 	// But we may not have a console user?
 
 	return cmd.Start()
+}
+
+func osversion() (string, error) {
+	return unix.Sysctl("kern.osrelease")
+}
+
+// logIndicatesSystrayNeedsRestart is Windows-only functionality
+func logIndicatesSystrayNeedsRestart(_ string) bool {
+	return false
 }

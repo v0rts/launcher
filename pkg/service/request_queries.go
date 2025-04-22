@@ -7,12 +7,11 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/endpoint"
-	"github.com/go-kit/kit/log/level"
 	"github.com/go-kit/kit/transport/http/jsonrpc"
 	"github.com/kolide/kit/contexts/uuid"
-	"github.com/osquery/osquery-go/plugin/distributed"
-
 	pb "github.com/kolide/launcher/pkg/pb/launcher"
+	"github.com/kolide/launcher/pkg/traces"
+	"github.com/osquery/osquery-go/plugin/distributed"
 )
 
 type queriesRequest struct {
@@ -20,6 +19,7 @@ type queriesRequest struct {
 }
 
 type queryCollectionResponse struct {
+	jsonRpcResponse
 	Queries     distributed.GetQueriesResult
 	NodeInvalid bool   `json:"node_invalid"`
 	ErrorCode   string `json:"error_code,omitempty"`
@@ -75,6 +75,9 @@ func decodeGRPCQueryCollection(_ context.Context, grpcReq interface{}) (interfac
 		queries.Queries[query.Id] = query.Query
 	}
 	return queryCollectionResponse{
+		jsonRpcResponse: jsonRpcResponse{
+			DisableDevice: req.DisableDevice,
+		},
 		Queries:     queries,
 		NodeInvalid: req.NodeInvalid,
 	}, nil
@@ -92,8 +95,9 @@ func encodeGRPCQueryCollection(_ context.Context, request interface{}) (interfac
 		)
 	}
 	resp := &pb.QueryCollection{
-		Queries:     queries,
-		NodeInvalid: req.NodeInvalid,
+		Queries:       queries,
+		NodeInvalid:   req.NodeInvalid,
+		DisableDevice: req.DisableDevice,
 	}
 	return encodeResponse(resp, req.Err)
 }
@@ -101,7 +105,7 @@ func encodeGRPCQueryCollection(_ context.Context, request interface{}) (interfac
 func encodeJSONRPCQueryCollection(_ context.Context, obj interface{}) (json.RawMessage, error) {
 	res, ok := obj.(queryCollectionResponse)
 	if !ok {
-		return encodeJSONResponse(nil, fmt.Errorf("Asserting result to *queryCollectionResponse failed. Got %T, %+v", obj, obj))
+		return encodeJSONResponse(nil, fmt.Errorf("asserting result to *queryCollectionResponse failed. Got %T, %+v", obj, obj))
 	}
 
 	b, err := json.Marshal(res)
@@ -132,6 +136,9 @@ func MakeRequestQueriesEndpoint(svc KolideService) endpoint.Endpoint {
 
 // RequestQueries implements KolideService.RequestQueries
 func (e Endpoints) RequestQueries(ctx context.Context, nodeKey string) (*distributed.GetQueriesResult, bool, error) {
+	ctx, span := traces.StartSpan(ctx)
+	defer span.End()
+
 	newCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	request := queriesRequest{NodeKey: nodeKey}
@@ -140,6 +147,11 @@ func (e Endpoints) RequestQueries(ctx context.Context, nodeKey string) (*distrib
 		return nil, false, err
 	}
 	resp := response.(queryCollectionResponse)
+
+	if resp.DisableDevice {
+		return nil, false, ErrDeviceDisabled{}
+	}
+
 	return &resp.Queries, resp.NodeInvalid, resp.Err
 }
 
@@ -155,11 +167,14 @@ func (mw logmw) RequestQueries(ctx context.Context, nodeKey string) (res *distri
 	defer func(begin time.Time) {
 		resJSON, _ := json.Marshal(res)
 		uuid, _ := uuid.FromContext(ctx)
-		logger := level.Debug(mw.logger)
+
+		message := "success"
 		if err != nil {
-			logger = level.Info(mw.logger)
+			message = "failure"
 		}
-		logger.Log(
+
+		mw.knapsack.Slogger().Log(ctx, levelForError(err), // nolint:sloglint // it's fine to not have a constant or literal here
+			message,
 			"method", "RequestQueries",
 			"uuid", uuid,
 			"res", string(resJSON),

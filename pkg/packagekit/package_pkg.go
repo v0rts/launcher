@@ -15,17 +15,12 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
 	"github.com/kolide/launcher/pkg/packagekit/applenotarization"
-
-	"go.opencensus.io/trace"
 )
 
 //go:embed assets/distribution.dist
 var distributionTemplate []byte
 
-func PackagePkg(ctx context.Context, w io.Writer, po *PackageOptions) error {
-	ctx, span := trace.StartSpan(ctx, "packagekit.PackagePkg")
-	defer span.End()
-
+func PackagePkg(ctx context.Context, w io.Writer, po *PackageOptions, arch string) error {
 	if err := isDirectory(po.Root); err != nil {
 		return err
 	}
@@ -43,7 +38,7 @@ func PackagePkg(ctx context.Context, w io.Writer, po *PackageOptions) error {
 		return fmt.Errorf("running pkgbuild: %w", err)
 	}
 
-	if err := runProductbuild(ctx, flatPkgPath, distributionPkgPath, po); err != nil {
+	if err := runProductbuild(ctx, flatPkgPath, distributionPkgPath, arch, po); err != nil {
 		return fmt.Errorf("running productbuild: %w", err)
 	}
 
@@ -61,7 +56,7 @@ func PackagePkg(ctx context.Context, w io.Writer, po *PackageOptions) error {
 		return fmt.Errorf("copying output: %w", err)
 	}
 
-	setInContext(ctx, ContextLauncherVersionKey, po.Version)
+	SetInContext(ctx, ContextLauncherVersionKey, po.Version)
 
 	return nil
 }
@@ -71,9 +66,6 @@ func runNotarize(ctx context.Context, file string, po *PackageOptions) error {
 	if po.AppleNotarizeUserId == "" || po.AppleNotarizeAppPassword == "" {
 		return nil
 	}
-
-	ctx, span := trace.StartSpan(ctx, "packagekit.runNotarize")
-	defer span.End()
 
 	logger := log.With(ctxlog.FromContext(ctx), "method", "packagekit.runNotarize")
 
@@ -89,7 +81,7 @@ func runNotarize(ctx context.Context, file string, po *PackageOptions) error {
 		"uuid", uuid,
 	)
 
-	setInContext(ctx, ContextNotarizationUuidKey, uuid)
+	SetInContext(ctx, ContextNotarizationUuidKey, uuid)
 
 	return nil
 }
@@ -97,14 +89,11 @@ func runNotarize(ctx context.Context, file string, po *PackageOptions) error {
 // runPkbuild produces a flat pkg file. It uses the directories
 // specified in PackageOptions, and then execs pkgbuild
 func runPkbuild(ctx context.Context, outputPath string, po *PackageOptions) error {
-	ctx, span := trace.StartSpan(ctx, "packagekit.runPkbuild")
-	defer span.End()
-
 	logger := log.With(ctxlog.FromContext(ctx), "method", "packagekit.runPkbuild")
 
 	// Run analyze to generate our component plist
 	componentPlist := "./launcher.plist"
-	analyzeCmd := exec.CommandContext(ctx, "pkgbuild", "--analyze", "--root", po.Root, componentPlist)
+	analyzeCmd := exec.CommandContext(ctx, "pkgbuild", "--analyze", "--root", po.Root, componentPlist) //nolint:forbidigo // Fine to use exec.CommandContext outside of launcher proper
 	if err := analyzeCmd.Run(); err != nil {
 		return fmt.Errorf("running analyze: %w", err)
 	}
@@ -121,7 +110,7 @@ func runPkbuild(ctx context.Context, outputPath string, po *PackageOptions) erro
 
 	// Set BundleIsRelocatable in the component plist to false -- this makes sure that the installer
 	// will install Kolide.app to the location that we expect
-	replaceCmd := exec.CommandContext(ctx, "plutil", "-replace", "BundleIsRelocatable", "-bool", "false", componentPlist)
+	replaceCmd := exec.CommandContext(ctx, "plutil", "-replace", "BundleIsRelocatable", "-bool", "false", componentPlist) //nolint:forbidigo // Fine to use exec.CommandContext outside of launcher proper
 	if err := replaceCmd.Run(); err != nil {
 		return fmt.Errorf("running plutil -replace: %w", err)
 	}
@@ -148,7 +137,7 @@ func runPkbuild(ctx context.Context, outputPath string, po *PackageOptions) erro
 		"args", fmt.Sprintf("%v", args),
 	)
 
-	cmd := exec.CommandContext(ctx, "pkgbuild", args...)
+	cmd := exec.CommandContext(ctx, "pkgbuild", args...) //nolint:forbidigo // Fine to use exec.CommandContext outside of launcher proper
 
 	stderr := new(bytes.Buffer)
 	cmd.Stderr = stderr
@@ -163,10 +152,7 @@ func runPkbuild(ctx context.Context, outputPath string, po *PackageOptions) erro
 // package. It does this by execing productbuild.
 //
 // See https://github.com/kolide/launcher/issues/407 and associated links
-func runProductbuild(ctx context.Context, flatPkgPath, distributionPkgPath string, po *PackageOptions) error {
-	ctx, span := trace.StartSpan(ctx, "packagekit.runProductbuild")
-	defer span.End()
-
+func runProductbuild(ctx context.Context, flatPkgPath, distributionPkgPath string, arch string, po *PackageOptions) error {
 	logger := log.With(ctxlog.FromContext(ctx), "method", "packagekit.runProductbuild")
 
 	// Create a distribution file so that we can set the title and the minimum OS version
@@ -178,15 +164,17 @@ func runProductbuild(ctx context.Context, flatPkgPath, distributionPkgPath strin
 	defer fh.Close()
 
 	var templateData = struct {
-		Title      string
-		Identifier string
-		Version    string
-		PkgName    string
+		Title             string
+		Identifier        string
+		Version           string
+		PkgName           string
+		HostArchitectures string
 	}{
-		Title:      po.Title,
-		Identifier: po.Identifier,
-		Version:    po.Version,
-		PkgName:    filepath.Base(flatPkgPath),
+		Title:             po.Title,
+		Identifier:        po.Identifier,
+		Version:           po.Version,
+		PkgName:           filepath.Base(flatPkgPath),
+		HostArchitectures: hostArchitectures(arch),
 	}
 	t, err := template.New("distribution").Parse(string(distributionTemplate))
 	if err != nil {
@@ -225,7 +213,7 @@ func runProductbuild(ctx context.Context, flatPkgPath, distributionPkgPath strin
 		"args", fmt.Sprintf("%v", args),
 	)
 
-	cmd := exec.CommandContext(ctx, "productbuild", args...)
+	cmd := exec.CommandContext(ctx, "productbuild", args...) //nolint:forbidigo // Fine to use exec.CommandContext outside of launcher proper
 
 	stderr := new(bytes.Buffer)
 	cmd.Stderr = stderr
@@ -234,4 +222,17 @@ func runProductbuild(ctx context.Context, flatPkgPath, distributionPkgPath strin
 	}
 
 	return nil
+}
+
+func hostArchitectures(arch string) string {
+	switch arch {
+	case "universal":
+		return "x86_64,arm64"
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "arm64"
+	default:
+		return "x86_64,arm64"
+	}
 }

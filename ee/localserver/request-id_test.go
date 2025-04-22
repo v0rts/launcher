@@ -2,18 +2,17 @@ package localserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"runtime"
 	"strings"
 	"testing"
 
-	"github.com/go-kit/kit/log"
-	"github.com/kolide/launcher/pkg/agent/storage"
-	storageci "github.com/kolide/launcher/pkg/agent/storage/ci"
-	"github.com/kolide/launcher/pkg/osquery"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/kolide/launcher/ee/agent/types"
+	typesMocks "github.com/kolide/launcher/ee/agent/types/mocks"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,10 +20,25 @@ import (
 func Test_localServer_requestIdHandler(t *testing.T) {
 	t.Parallel()
 
-	var logBytes bytes.Buffer
-	server := testServer(t, &logBytes)
+	mockKnapsack := typesMocks.NewKnapsack(t)
+	mockKnapsack.On("KolideServerURL").Return("localhost")
+	mockKnapsack.On("CurrentEnrollmentStatus").Return(types.Enrolled, nil)
+	mockKnapsack.On("GetEnrollmentDetails").Return(types.EnrollmentDetails{OSVersion: "1", Hostname: "test"}, nil)
 
-	req, err := http.NewRequest("", "", nil)
+	enrollSecret, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"organization": "test-munemo"}).SignedString([]byte("test"))
+	require.NoError(t, err)
+
+	mockKnapsack.On("ReadEnrollSecret").Return(enrollSecret, nil)
+
+	var logBytes bytes.Buffer
+	slogger := slog.New(slog.NewJSONHandler(&logBytes, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	mockKnapsack.On("Slogger").Return(slogger)
+
+	server := testServer(t, mockKnapsack)
+
+	req, err := http.NewRequest("", "", nil) //nolint:noctx // Don't care about this in tests
 	require.NoError(t, err)
 
 	handler := http.HandlerFunc(server.requestIdHandlerFunc)
@@ -43,23 +57,11 @@ func Test_localServer_requestIdHandler(t *testing.T) {
 	var response requestIdsResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
 
-	// in the current CI environment (GitHub Actions) the linux runner
-	// does not have a console user, so we expect an empty list
-	if os.Getenv("CI") == "true" && runtime.GOOS == "linux" {
-		assert.Empty(t, response.ConsoleUsers)
-		return
-	}
-
-	assert.GreaterOrEqual(t, len(response.ConsoleUsers), 1, "should have at least one console user")
+	mockKnapsack.AssertExpectations(t)
 }
 
-func testServer(t *testing.T, logBytes *bytes.Buffer) *localServer {
-	s, err := storageci.NewStore(t, log.NewNopLogger(), storage.ConfigStore.String())
-	require.NoError(t, err)
-
-	require.NoError(t, osquery.SetupLauncherKeys(s))
-
-	server, err := New(s, "", WithLogger(log.NewLogfmtLogger(logBytes)))
+func testServer(t *testing.T, k types.Knapsack) *localServer {
+	server, err := New(context.TODO(), k, nil)
 	require.NoError(t, err)
 	return server
 }

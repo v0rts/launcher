@@ -1,24 +1,22 @@
 package table
 
 import (
-	"bytes"
 	"context"
-	"fmt"
-	"os/exec"
+	"log/slog"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/go-kit/kit/log"
-
-	"github.com/osquery/osquery-go"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/allowedcmd"
+	"github.com/kolide/launcher/ee/tables/tablehelpers"
+	"github.com/kolide/launcher/ee/tables/tablewrapper"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
-func TouchIDSystemConfig(client *osquery.ExtensionManagerClient, logger log.Logger) *table.Plugin {
+func TouchIDSystemConfig(flags types.Flags, slogger *slog.Logger) *table.Plugin {
 	t := &touchIDSystemConfigTable{
-		client: client,
-		logger: logger,
+		slogger: slogger.With("table", "kolide_touchid_system_config"),
 	}
 	columns := []table.ColumnDefinition{
 		table.IntegerColumn("touchid_compatible"),
@@ -27,40 +25,33 @@ func TouchIDSystemConfig(client *osquery.ExtensionManagerClient, logger log.Logg
 		table.IntegerColumn("touchid_unlock"),
 	}
 
-	return table.NewPlugin("kolide_touchid_system_config", columns, t.generate)
+	return tablewrapper.New(flags, slogger, "kolide_touchid_system_config", columns, t.generate)
 }
 
 type touchIDSystemConfigTable struct {
-	client *osquery.ExtensionManagerClient
-	logger log.Logger
-	config *touchIDSystemConfig
-}
-
-type touchIDSystemConfig struct {
-	touchIDCompatible int
-	secureEnclaveCPU  string
-	touchIDEnabled    int
-	touchIDUnlock     int
+	slogger *slog.Logger
 }
 
 // TouchIDSystemConfigGenerate will be called whenever the table is queried.
 func (t *touchIDSystemConfigTable) generate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+	ctx, span := traces.StartSpan(ctx, "table_name", "kolide_touchid_system_config")
+	defer span.End()
 
 	var results []map[string]string
 	var touchIDCompatible, secureEnclaveCPU, touchIDEnabled, touchIDUnlock string
 
-	// Read the security chip from system_profiler
-	var stdout bytes.Buffer
-	cmd := exec.CommandContext(ctx, "/usr/sbin/system_profiler", "SPiBridgeDataType")
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("calling system_profiler: %w", err)
+	stdout, err := tablehelpers.RunSimple(ctx, t.slogger, 10, allowedcmd.SystemProfiler, []string{"SPiBridgeDataType"})
+	if err != nil {
+		t.slogger.Log(ctx, slog.LevelDebug,
+			"execing system_profiler SPiBridgeDataType",
+			"err", err,
+		)
+		return results, nil
 	}
 
+	// Read the security chip from system_profiler
 	r := regexp.MustCompile(` (?P<chip>T\d) `) // Matching on: Apple T[1|2] Security Chip
-	match := r.FindStringSubmatch(string(stdout.Bytes()))
+	match := r.FindStringSubmatch(string(stdout))
 	if len(match) == 0 {
 		secureEnclaveCPU = ""
 	} else {
@@ -68,13 +59,16 @@ func (t *touchIDSystemConfigTable) generate(ctx context.Context, queryContext ta
 	}
 
 	// Read the system's bioutil configuration
-	stdout.Reset()
-	cmd = exec.CommandContext(ctx, "/usr/bin/bioutil", "-r", "-s")
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("calling bioutil for system configuration: %w", err)
+	stdout, err = tablehelpers.RunSimple(ctx, t.slogger, 10, allowedcmd.Bioutil, []string{"-r", "-s"})
+	if err != nil {
+		t.slogger.Log(ctx, slog.LevelDebug,
+			"execing bioutil",
+			"err", err,
+		)
+		return results, nil
 	}
-	configOutStr := string(stdout.Bytes())
+
+	configOutStr := string(stdout)
 	configSplit := strings.Split(configOutStr, ":")
 	if len(configSplit) >= 3 {
 		touchIDCompatible = "1"

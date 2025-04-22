@@ -7,11 +7,12 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/endpoint"
-	"github.com/go-kit/kit/log/level"
 	"github.com/go-kit/kit/transport/http/jsonrpc"
 	"github.com/kolide/kit/contexts/uuid"
 
+	"github.com/kolide/launcher/ee/agent/types"
 	pb "github.com/kolide/launcher/pkg/pb/launcher"
+	"github.com/kolide/launcher/pkg/traces"
 )
 
 type enrollmentRequest struct {
@@ -20,27 +21,10 @@ type enrollmentRequest struct {
 	EnrollmentDetails EnrollmentDetails
 }
 
-type EnrollmentDetails struct {
-	OSVersion                 string `json:"os_version"`
-	OSBuildID                 string `json:"os_build_id"`
-	OSPlatform                string `json:"os_platform"`
-	Hostname                  string `json:"hostname"`
-	HardwareVendor            string `json:"hardware_vendor"`
-	HardwareModel             string `json:"hardware_model"`
-	HardwareSerial            string `json:"hardware_serial"`
-	OsqueryVersion            string `json:"osquery_version"`
-	LauncherHardwareKey       string `json:"launcher_hardware_key"`
-	LauncherHardwareKeySource string `json:"launcher_hardware_key_source"`
-	LauncherLocalKey          string `json:"launcher_local_key"`
-	LauncherVersion           string `json:"launcher_version"`
-	OSName                    string `json:"os_name"`
-	OSPlatformLike            string `json:"os_platform_like"`
-	GOOS                      string `json:"goos"`
-	GOARCH                    string `json:"goarch"`
-	HardwareUUID              string `json:"hardware_uuid"`
-}
+type EnrollmentDetails = types.EnrollmentDetails
 
 type enrollmentResponse struct {
+	jsonRpcResponse
 	NodeKey     string `json:"node_key"`
 	NodeInvalid bool   `json:"node_invalid"`
 	ErrorCode   string `json:"error_code,omitempty"`
@@ -102,7 +86,7 @@ func decodeJSONRPCEnrollmentResponse(_ context.Context, res jsonrpc.Response) (i
 func encodeJSONRPCEnrollmentResponse(_ context.Context, obj interface{}) (json.RawMessage, error) {
 	res, ok := obj.(enrollmentResponse)
 	if !ok {
-		return encodeJSONResponse(nil, fmt.Errorf("Asserting result to *enrollmentResponse failed. Got %T, %+v", obj, obj))
+		return encodeJSONResponse(nil, fmt.Errorf("asserting result to *enrollmentResponse failed. Got %T, %+v", obj, obj))
 	}
 
 	b, err := json.Marshal(res)
@@ -138,6 +122,9 @@ func encodeGRPCEnrollmentRequest(_ context.Context, request interface{}) (interf
 func decodeGRPCEnrollmentResponse(_ context.Context, grpcReq interface{}) (interface{}, error) {
 	req := grpcReq.(*pb.EnrollmentResponse)
 	return enrollmentResponse{
+		jsonRpcResponse: jsonRpcResponse{
+			DisableDevice: req.DisableDevice,
+		},
 		NodeKey:     req.NodeKey,
 		NodeInvalid: req.NodeInvalid,
 	}, nil
@@ -146,8 +133,9 @@ func decodeGRPCEnrollmentResponse(_ context.Context, grpcReq interface{}) (inter
 func encodeGRPCEnrollmentResponse(_ context.Context, request interface{}) (interface{}, error) {
 	req := request.(enrollmentResponse)
 	resp := &pb.EnrollmentResponse{
-		NodeKey:     req.NodeKey,
-		NodeInvalid: req.NodeInvalid,
+		NodeKey:       req.NodeKey,
+		NodeInvalid:   req.NodeInvalid,
+		DisableDevice: req.DisableDevice,
 	}
 	return encodeResponse(resp, req.Err)
 }
@@ -169,15 +157,24 @@ const requestTimeout = 60 * time.Second
 
 // RequestEnrollment implements KolideService.RequestEnrollment
 func (e Endpoints) RequestEnrollment(ctx context.Context, enrollSecret, hostIdentifier string, details EnrollmentDetails) (string, bool, error) {
+	ctx, span := traces.StartSpan(ctx)
+	defer span.End()
+
 	newCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
 	request := enrollmentRequest{EnrollSecret: enrollSecret, HostIdentifier: hostIdentifier, EnrollmentDetails: details}
 	response, err := e.RequestEnrollmentEndpoint(newCtx, request)
+
 	if err != nil {
 		return "", false, err
 	}
 	resp := response.(enrollmentResponse)
+
+	if resp.DisableDevice {
+		return "", false, ErrDeviceDisabled{}
+	}
+
 	return resp.NodeKey, resp.NodeInvalid, resp.Err
 }
 
@@ -193,6 +190,11 @@ func (mw logmw) RequestEnrollment(ctx context.Context, enrollSecret, hostIdentif
 	defer func(begin time.Time) {
 		uuid, _ := uuid.FromContext(ctx)
 
+		message := "success"
+		if err != nil {
+			message = "failure"
+		}
+
 		keyvals := []interface{}{
 			"method", "RequestEnrollment",
 			"uuid", uuid,
@@ -202,16 +204,14 @@ func (mw logmw) RequestEnrollment(ctx context.Context, enrollSecret, hostIdentif
 			"took", time.Since(begin),
 		}
 
-		logger := level.Debug(mw.logger)
 		if err != nil {
-			logger = level.Info(mw.logger)
 			keyvals = append(keyvals,
 				"enrollSecret", enrollSecret,
 				"nodekey", nodekey,
 			)
 		}
-		logger.Log(keyvals...)
 
+		mw.knapsack.Slogger().Log(ctx, levelForError(err), message, keyvals...) // nolint:sloglint // it's fine to not have a constant or literal here
 	}(time.Now())
 
 	nodekey, reauth, err = mw.next.RequestEnrollment(ctx, enrollSecret, hostIdentifier, details)

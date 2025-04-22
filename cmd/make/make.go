@@ -17,7 +17,6 @@ import (
 func main() {
 	buildAll := strings.Join([]string{
 		"deps-go",
-		"install-tools",
 	}, ",")
 
 	fs := flag.NewFlagSet("make", flag.ExitOnError)
@@ -43,7 +42,7 @@ func main() {
 
 	if err := ff.Parse(fs, os.Args[1:], ffOpts...); err != nil {
 		logger := logutil.NewCLILogger(true)
-		logutil.Fatal(logger, "msg", "Error parsing flags", "err", err)
+		logutil.Fatal(logger, "msg", "Error parsing flags", "err", err) //nolint:forbidigo // Fine to use logutil.Fatal outside of launcher proper
 	}
 
 	logger := logutil.NewCLILogger(*flDebug)
@@ -81,17 +80,15 @@ func main() {
 	// on linux (for fscrypt)
 	optsMaybeCgo := opts
 	if *flBuildOS == "linux" {
-		// overwrite with append, since optsMaybyeCgo was a shallow clone
+		// overwrite with append, since optsMaybeCgo was a shallow clone
 		optsMaybeCgo = append(opts, make.WithCgo())
 	}
 
 	targetSet := map[string]func(context.Context) error{
 		"deps-go":         make.New(opts...).DepsGo,
-		"install-tools":   make.New(opts...).InstallTools,
-		"generate-tuf":    make.New(opts...).GenerateTUF,
 		"launcher":        make.New(optsMaybeCgo...).BuildCmd("./cmd/launcher", fakeName("launcher", *flFakeData)),
 		"tables.ext":      make.New(optsMaybeCgo...).BuildCmd("./cmd/launcher.ext", "tables.ext"),
-		"grpc.ext":        make.New(opts...).BuildCmd("./cmd/grpc.ext", "grpc.ext"),
+		"grpc.ext":        make.New(optsMaybeCgo...).BuildCmd("./cmd/grpc.ext", "grpc.ext"),
 		"package-builder": make.New(opts...).BuildCmd("./cmd/package-builder", "package-builder"),
 		"make":            make.New(opts...).BuildCmd("./cmd/make", "make"),
 	}
@@ -101,10 +98,10 @@ func main() {
 			if fn, ok := targetSet[target]; ok {
 				level.Debug(logger).Log("msg", "calling target", "target", target)
 				if err := fn(ctx); err != nil {
-					logutil.Fatal(logger, "msg", "Target Failed", "err", err, "target", target)
+					logutil.Fatal(logger, "msg", "Target Failed", "err", err, "target", target) //nolint:forbidigo // Fine to use logutil.Fatal outside of launcher proper
 				}
 			} else {
-				logutil.Fatal(logger, "err", "target does not exist", "target", target)
+				logutil.Fatal(logger, "err", "target does not exist", "target", target) //nolint:forbidigo // Fine to use logutil.Fatal outside of launcher proper
 			}
 		}
 	}

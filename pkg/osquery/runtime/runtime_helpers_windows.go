@@ -4,11 +4,14 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"syscall"
+	"time"
 
-	"github.com/kolide/kit/ulid"
+	"github.com/kolide/launcher/ee/allowedcmd"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/pkg/errors"
 )
 
@@ -18,14 +21,42 @@ func setpgid() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{}
 }
 
-func killProcessGroup(cmd *exec.Cmd) error {
+func killProcessGroup(origCmd *exec.Cmd) error {
+	ctx, span := traces.StartSpan(context.Background())
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
 	// some discussion here https://github.com/golang/dep/pull/857
-	// TODO: should we check err?
-	exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprint(cmd.Process.Pid)).Run()
+	cmd, err := allowedcmd.Taskkill(ctx, "/F", "/T", "/PID", fmt.Sprint(origCmd.Process.Pid))
+	if err != nil {
+		traces.SetError(span, fmt.Errorf("creating command: %w", err))
+		return fmt.Errorf("creating command: %w", err)
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if len(out) > 0 {
+			err = fmt.Errorf("running taskkill: output: %s, err: %w", string(out), err)
+			traces.SetError(span, err)
+			return err
+		}
+
+		if ctx.Err() != nil {
+			err = fmt.Errorf("running taskkill: context err: %v, err: %w", ctx.Err(), err)
+			traces.SetError(span, err)
+			return err
+		}
+
+		traces.SetError(span, fmt.Errorf("running taskkill: %w", err))
+		return fmt.Errorf("running taskkill: err: %w", err)
+	}
+
 	return nil
 }
 
-func SocketPath(rootDir string) string {
+func SocketPath(rootDir string, id string) string {
 	// On windows, local names pipes paths are all rooted in \\.\pipe\
 	// their names are limited to 256 characters, and can include any
 	// character other than backslash. They are case insensitive.
@@ -38,9 +69,9 @@ func SocketPath(rootDir string) string {
 	// launcher and osquery. We would like to be able to run multiple
 	// launchers.
 	//
-	// We could use something based on the laumcher root, but given the
+	// We could use something based on the launcher root, but given the
 	// context this runs in a ulid seems simpler.
-	return fmt.Sprintf(`\\.\pipe\kolide-osquery-%s`, ulid.New())
+	return fmt.Sprintf(`\\.\pipe\kolide-osquery-%s`, id)
 }
 
 func platformArgs() []string {
@@ -58,8 +89,4 @@ func isExitOk(err error) bool {
 		}
 	}
 	return false
-}
-
-func ensureProperPermissions(o *OsqueryInstance, path string) error {
-	return nil
 }

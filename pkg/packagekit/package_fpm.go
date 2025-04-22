@@ -14,22 +14,21 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kolide/launcher/pkg/contexts/ctxlog"
-
-	"go.opencensus.io/trace"
 )
 
 type outputType string
 
 const (
 	Deb    outputType = "deb"
-	RPM               = "rpm"
-	Tar               = "tar"
-	Pacman            = "pacman"
+	RPM    outputType = "rpm"
+	Tar    outputType = "tar"
+	Pacman outputType = "pacman"
 )
 
 type fpmOptions struct {
 	outputType outputType
 	replaces   []string
+	arch       string
 }
 
 type FpmOpt func(*fpmOptions)
@@ -67,9 +66,13 @@ func WithReplaces(r []string) FpmOpt {
 	}
 }
 
+func WithArch(arch string) FpmOpt {
+	return func(f *fpmOptions) {
+		f.arch = arch
+	}
+}
+
 func PackageFPM(ctx context.Context, w io.Writer, po *PackageOptions, fpmOpts ...FpmOpt) error {
-	ctx, span := trace.StartSpan(ctx, "packagekit.PackageRPM")
-	defer span.End()
 	logger := log.With(ctxlog.FromContext(ctx), "caller", "packagekit.PackageFPM")
 
 	f := fpmOptions{}
@@ -78,7 +81,11 @@ func PackageFPM(ctx context.Context, w io.Writer, po *PackageOptions, fpmOpts ..
 	}
 
 	if f.outputType == "" {
-		return errors.New("Missing output type")
+		return errors.New("missing output type")
+	}
+
+	if f.arch == "" {
+		return errors.New("missing architecture")
 	}
 
 	if err := isDirectory(po.Root); err != nil {
@@ -99,6 +106,7 @@ func PackageFPM(ctx context.Context, w io.Writer, po *PackageOptions, fpmOpts ..
 		"-t", string(f.outputType),
 		"-n", fmt.Sprintf("%s-%s", po.Name, po.Identifier),
 		"-v", po.Version,
+		"-a", f.arch,
 		"-p", filepath.Join("/out", outputFilename),
 		"-C", "/pkgsrc",
 	}
@@ -122,16 +130,22 @@ func PackageFPM(ctx context.Context, w io.Writer, po *PackageOptions, fpmOpts ..
 		fpmCommand = append(fpmCommand, "--before-remove", filepath.Join("/pkgscripts", "prerm"))
 	}
 
-	dockerArgs := []string{
-		"run", "--rm",
-		"-v", fmt.Sprintf("%s:/pkgsrc", po.Root),
-		"-v", fmt.Sprintf("%s:/pkgscripts", po.Scripts),
-		"-v", fmt.Sprintf("%s:/out", outputPathDir),
-		"--entrypoint", "", // override this, to ensure more compatibility with the plain command line
-		"kolide/fpm:latest",
+	mountSuffix := ""
+	if po.ContainerTool == "podman" {
+		// private volume, necessary to avoid permission issues when building rootlessly
+		mountSuffix = ":Z"
 	}
 
-	cmd := exec.CommandContext(ctx, "docker", append(dockerArgs, fpmCommand...)...)
+	args := []string{
+		"run", "--rm",
+		"-v", fmt.Sprintf("%s:/pkgsrc%s", po.Root, mountSuffix),
+		"-v", fmt.Sprintf("%s:/pkgscripts%s", po.Scripts, mountSuffix),
+		"-v", fmt.Sprintf("%s:/out%s", outputPathDir, mountSuffix),
+		"--entrypoint", "", // override this, to ensure more compatibility with the plain command line
+		"docker.io/kolide/fpm:latest",
+	}
+
+	cmd := exec.CommandContext(ctx, po.ContainerTool, append(args, fpmCommand...)...) //nolint:forbidigo // Fine to use exec.CommandContext outside of launcher proper
 
 	stderr := new(bytes.Buffer)
 	stdout := new(bytes.Buffer)
@@ -166,7 +180,7 @@ func PackageFPM(ctx context.Context, w io.Writer, po *PackageOptions, fpmOpts ..
 		return fmt.Errorf("copying output: %w", err)
 	}
 
-	setInContext(ctx, ContextLauncherVersionKey, po.Version)
+	SetInContext(ctx, ContextLauncherVersionKey, po.Version)
 
 	return nil
 }

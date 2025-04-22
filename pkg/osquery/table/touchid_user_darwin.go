@@ -1,27 +1,23 @@
 package table
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"os/exec"
+	"log/slog"
 	"os/user"
-	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-
-	"github.com/osquery/osquery-go"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/allowedcmd"
+	"github.com/kolide/launcher/ee/tables/tablehelpers"
+	"github.com/kolide/launcher/ee/tables/tablewrapper"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
-func TouchIDUserConfig(client *osquery.ExtensionManagerClient, logger log.Logger) *table.Plugin {
+func TouchIDUserConfig(flags types.Flags, slogger *slog.Logger) *table.Plugin {
 	t := &touchIDUserConfigTable{
-		client: client,
-		logger: logger,
+		slogger: slogger.With("table", "kolide_touchid_user_config"),
 	}
 	columns := []table.ColumnDefinition{
 		table.IntegerColumn("uid"),
@@ -32,30 +28,21 @@ func TouchIDUserConfig(client *osquery.ExtensionManagerClient, logger log.Logger
 		table.IntegerColumn("effective_applepay"),
 	}
 
-	return table.NewPlugin("kolide_touchid_user_config", columns, t.generate)
+	return tablewrapper.New(flags, slogger, "kolide_touchid_user_config", columns, t.generate)
 }
 
 type touchIDUserConfigTable struct {
-	client *osquery.ExtensionManagerClient
-	logger log.Logger
-	config *touchIDUserConfig
-}
-
-type touchIDUserConfig struct {
-	uid                    int
-	fingerprintsRegistered int
-	touchIDUnlock          int
-	touchIDApplePay        int
-	effectiveUnlock        int
-	effectiveApplePay      int
+	slogger *slog.Logger
 }
 
 func (t *touchIDUserConfigTable) generate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
-	q, _ := queryContext.Constraints["uid"]
+	ctx, span := traces.StartSpan(ctx, "table_name", "kolide_touchid_user_config")
+	defer span.End()
+
+	q := queryContext.Constraints["uid"]
 	if len(q.Constraints) == 0 {
-		level.Debug(t.logger).Log(
-			"msg", "The touchid_user_config table requires that you specify a constraint WHERE uid =",
-			"err", "no constraints",
+		t.slogger.Log(ctx, slog.LevelDebug,
+			"table requires a uid constraint, but none provided",
 		)
 		return nil, errors.New("The touchid_user_config table requires that you specify a constraint WHERE uid =")
 	}
@@ -65,28 +52,27 @@ func (t *touchIDUserConfigTable) generate(ctx context.Context, queryContext tabl
 		var touchIDUnlock, touchIDApplePay, effectiveUnlock, effectiveApplePay string
 
 		// Verify the user exists on the system before proceeding
-		_, err := user.LookupId(constraint.Expression)
+		u, err := user.LookupId(constraint.Expression)
 		if err != nil {
-			level.Debug(t.logger).Log(
-				"msg", "nonexistant user",
+			t.slogger.Log(ctx, slog.LevelDebug,
+				"nonexistent user",
 				"uid", constraint.Expression,
 				"err", err,
 			)
 			continue
 		}
-		uid, _ := strconv.Atoi(constraint.Expression)
 
 		// Get the user's TouchID config
-		configOutput, err := runCommandContext(ctx, uid, "/usr/bin/bioutil", "-r")
+		configOutput, err := tablehelpers.RunSimple(ctx, t.slogger, 10, allowedcmd.Bioutil, []string{"-r"}, tablehelpers.WithUid(u.Uid))
 		if err != nil {
-			level.Debug(t.logger).Log(
-				"msg", "could not run bioutil -r",
-				"uid", uid,
+			t.slogger.Log(ctx, slog.LevelInfo,
+				"could not run bioutil -r",
+				"uid", u.Uid,
 				"err", err,
 			)
 			continue
 		}
-		configSplit := strings.Split(configOutput, ":")
+		configSplit := strings.Split(string(configOutput), ":")
 
 		// If the length of the split is 2, TouchID is not configured for this user
 		// Otherwise, extract the values from the split.
@@ -98,25 +84,25 @@ func (t *touchIDUserConfigTable) generate(ctx context.Context, queryContext tabl
 			effectiveUnlock = configSplit[4][1:2]
 			effectiveApplePay = configSplit[5][1:2]
 		} else {
-			level.Debug(t.logger).Log(
-				"msg", configOutput,
-				"uid", uid,
-				"err", "bioutil -r returned unexpected output",
+			t.slogger.Log(ctx, slog.LevelDebug,
+				"bioutil -r returned unexpected output",
+				"uid", u.Uid,
+				"output", string(configOutput),
 			)
 			continue
 		}
 
 		// Grab the fingerprint count
-		countOutStr, err := runCommandContext(ctx, uid, "/usr/bin/bioutil", "-c")
+		countOut, err := tablehelpers.RunSimple(ctx, t.slogger, 10, allowedcmd.Bioutil, []string{"-c"}, tablehelpers.WithUid(u.Uid))
 		if err != nil {
-			level.Debug(t.logger).Log(
-				"msg", "could not run bioutil -c",
-				"uid", uid,
+			t.slogger.Log(ctx, slog.LevelDebug,
+				"could not run bioutil -c",
+				"uid", u.Uid,
 				"err", err,
 			)
 			continue
 		}
-		countSplit := strings.Split(countOutStr, ":")
+		countSplit := strings.Split(string(countOut), ":")
 		fingerprintCount := strings.ReplaceAll(countSplit[1], "\t", "")[:1]
 
 		// If the fingerprint count is 0, set effective values to 0
@@ -127,7 +113,7 @@ func (t *touchIDUserConfigTable) generate(ctx context.Context, queryContext tabl
 		}
 
 		result := map[string]string{
-			"uid":                     strconv.Itoa(uid),
+			"uid":                     u.Uid,
 			"fingerprints_registered": fingerprintCount,
 			"touchid_unlock":          touchIDUnlock,
 			"touchid_applepay":        touchIDApplePay,
@@ -138,32 +124,4 @@ func (t *touchIDUserConfigTable) generate(ctx context.Context, queryContext tabl
 	}
 
 	return results, nil
-}
-
-// runCommand runs a given command and arguments as the supplied user
-func runCommandContext(ctx context.Context, uid int, cmd string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	// Set up the command
-	var stdout bytes.Buffer
-	c := exec.CommandContext(ctx, cmd, args...)
-	c.Stdout = &stdout
-
-	// Check if the supplied UID is that of the current user
-	currentUser, err := user.Current()
-	if err != nil {
-		return "", err
-	}
-	if strconv.Itoa(uid) != currentUser.Uid {
-		c.SysProcAttr = &syscall.SysProcAttr{}
-		c.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: 20}
-	}
-
-	// Run the command
-	if err := c.Run(); err != nil {
-		return "", err
-	}
-
-	return string(stdout.Bytes()), nil
 }

@@ -44,10 +44,20 @@ var defaultWixPath = wix.FindWixInstall()
 func runMake(args []string) error {
 	flagset := flag.NewFlagSet("macos", flag.ExitOnError)
 	var (
+		flKolideUsage = flagset.Bool(
+			"i-am-a-kolide-customer",
+			false,
+			"Certify that I am a Kolide customer and in compliance with the terms of the EE license",
+		)
 		flDebug = flagset.Bool(
 			"debug",
 			false,
 			"enable debug logging",
+		)
+		flContainerTool = flagset.String(
+			"container_tool",
+			"docker",
+			"container orchestration tool to build with ('docker', 'podman')",
 		)
 		flHostname = flagset.String(
 			"hostname",
@@ -59,6 +69,11 @@ func runMake(args []string) error {
 			env.String("PACKAGE_VERSION", ""),
 			"the resultant package version. If left blank, auto detection will be attempted",
 		)
+		flBinRootDir = flagset.String(
+			"bin_root_dir",
+			"/usr/local",
+			"the root directory path for the launcher on macOS and Linux",
+		)
 		flOsqueryVersion = flagset.String(
 			"osquery_version",
 			env.String("OSQUERY_VERSION", "stable"),
@@ -68,6 +83,16 @@ func runMake(args []string) error {
 			"launcher_version",
 			env.String("LAUNCHER_VERSION", "stable"),
 			"What TUF channel to download launcher from. Supports filesystem paths",
+		)
+		flLauncherPath = flagset.String(
+			"launcher_path",
+			"",
+			"Path of local launcher binary to use in packaging",
+		)
+		flLauncherArmPath = flagset.String(
+			"launcher_arm_path",
+			"",
+			"Path of local launcher arm64 binary to use in packaging",
 		)
 		flExtensionVersion = flagset.String(
 			"extension_version",
@@ -144,20 +169,15 @@ func runMake(args []string) error {
 			env.String("TARGETS", defaultTargets()),
 			"Target platforms to build. Specified in the form platform-init-package",
 		)
-		flNotaryURL = flagset.String(
-			"notary_url",
-			env.String("NOTARY_URL", ""),
-			"The Notary update server",
+		flTufURL = flagset.String(
+			"tuf_url",
+			env.String("TUF_URL", ""),
+			"The TUF update server",
 		)
 		flMirrorURL = flagset.String(
 			"mirror_url",
 			env.String("MIRROR_URL", ""),
 			"The mirror server for autoupdates",
-		)
-		flNotaryPrefix = flagset.String(
-			"notary_prefix",
-			env.String("NOTARY_PREFIX", ""),
-			"The prefix for Notary path that contains the collections",
 		)
 		flWixPath = flagset.String(
 			"wix_path",
@@ -183,6 +203,12 @@ func runMake(args []string) error {
 		return err
 	}
 
+	if !*flKolideUsage {
+		fmt.Fprintf(os.Stderr, "\nThe Kolide Agent is for use with the Kolide Service.\n")
+		fmt.Fprintf(os.Stderr, "See https://github.com/kolide/launcher/blob/main/ee/LICENSE\n")
+		return errors.New("")
+	}
+
 	logger := log.NewJSONLogger(os.Stderr)
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	logger = log.With(logger, "caller", log.DefaultCaller)
@@ -197,7 +223,7 @@ func runMake(args []string) error {
 	ctx = ctxlog.NewContext(ctx, logger)
 
 	if *flHostname == "" {
-		return errors.New("Hostname undefined")
+		return errors.New("hostname undefined")
 	}
 
 	// Validate that pinned certs are valid hex
@@ -219,14 +245,19 @@ func runMake(args []string) error {
 	}
 
 	packageOptions := packaging.PackageOptions{
-		PackageVersion:    *flPackageVersion,
-		OsqueryVersion:    *flOsqueryVersion,
-		OsqueryFlags:      flOsqueryFlags,
-		LauncherVersion:   *flLauncherVersion,
+		PackageVersion:  *flPackageVersion,
+		OsqueryVersion:  *flOsqueryVersion,
+		OsqueryFlags:    flOsqueryFlags,
+		LauncherVersion: *flLauncherVersion,
+		LauncherPath:    *flLauncherPath,
+		// LauncherArmPath can be used for windows arm64 packages when you want
+		// to specify a local path to the launcher binary
+		LauncherArmPath:   *flLauncherArmPath,
 		ExtensionVersion:  *flExtensionVersion,
 		Hostname:          *flHostname,
 		Secret:            *flEnrollSecret,
 		AppleSigningKey:   *flSigningKey,
+		ContainerTool:     *flContainerTool,
 		Transport:         *flTransport,
 		Insecure:          *flInsecure,
 		InsecureTransport: *flInsecureTransport,
@@ -236,10 +267,10 @@ func runMake(args []string) error {
 		OmitSecret:        *flOmitSecret,
 		CertPins:          *flCertPins,
 		RootPEM:           *flRootPEM,
+		BinRootDir:        *flBinRootDir,
 		CacheDir:          cacheDir,
-		NotaryURL:         *flNotaryURL,
+		TufServerURL:      *flTufURL,
 		MirrorURL:         *flMirrorURL,
-		NotaryPrefix:      *flNotaryPrefix,
 		WixPath:           *flWixPath,
 		WixSkipCleanup:    *flWixSkipCleanup,
 		DisableService:    *flDisableService,
@@ -250,7 +281,7 @@ func runMake(args []string) error {
 	// NOTE: if you are using docker-for-mac, you probably need to set the TMPDIR env to /tmp
 	if outputDir == "" {
 		var err error
-		outputDir, err = os.MkdirTemp("", fmt.Sprintf("launcher-package"))
+		outputDir, err = os.MkdirTemp("", "launcher-package")
 		if err != nil {
 			return fmt.Errorf("making output dir: %w", err)
 		}
@@ -265,19 +296,27 @@ func runMake(args []string) error {
 	}
 
 	for _, target := range targets {
-		outputFileName := fmt.Sprintf("launcher.%s.%s", target.String(), target.PkgExtension())
-		outputFile, err := os.Create(filepath.Join(outputDir, outputFileName))
-		if err != nil {
-			return fmt.Errorf("Failed to make package output file: %w", err)
-		}
-		defer outputFile.Close()
-
-		if err := packageOptions.Build(ctx, outputFile, target); err != nil {
-			return fmt.Errorf("could not generate packages: %w", err)
+		if err := makeTarget(ctx, target, packageOptions, outputDir); err != nil {
+			return fmt.Errorf("making target %s: %w", target.String(), err)
 		}
 	}
 
 	fmt.Printf("Built packages in %s\n", outputDir)
+	return nil
+}
+
+func makeTarget(ctx context.Context, target packaging.Target, packageOptions packaging.PackageOptions, outputDir string) error {
+	outputFileName := fmt.Sprintf("launcher.%s.%s", target.String(), target.PkgExtension())
+	outputFile, err := os.Create(filepath.Join(outputDir, outputFileName))
+	if err != nil {
+		return fmt.Errorf("failed to make package output file: %w", err)
+	}
+	defer outputFile.Close()
+
+	if err := packageOptions.Build(ctx, outputFile, target); err != nil {
+		return fmt.Errorf("could not generate packages: %w", err)
+	}
+
 	return nil
 }
 
@@ -313,7 +352,7 @@ func usage() {
 func main() {
 	if len(os.Args) < 2 {
 		usage()
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher
 	}
 
 	var run func([]string) error
@@ -326,12 +365,12 @@ func main() {
 		run = runListTargets
 	default:
 		usage()
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher
 	}
 
 	if err := run(os.Args[2:]); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // Fine to use os.Exit outside of launcher
 	}
 }
 

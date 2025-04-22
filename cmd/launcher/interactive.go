@@ -3,59 +3,75 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
 	"github.com/kolide/launcher/cmd/launcher/internal"
-	"github.com/kolide/launcher/pkg/agent"
-	"github.com/kolide/launcher/pkg/autoupdate"
+	"github.com/kolide/launcher/ee/agent"
+	"github.com/kolide/launcher/ee/agent/flags"
+	"github.com/kolide/launcher/ee/agent/knapsack"
+	"github.com/kolide/launcher/ee/agent/storage/inmemory"
+	"github.com/kolide/launcher/ee/tuf"
+	"github.com/kolide/launcher/pkg/launcher"
+	"github.com/kolide/launcher/pkg/log/multislogger"
 	"github.com/kolide/launcher/pkg/osquery/interactive"
 )
 
-func runInteractive(args []string) error {
-	flagset := flag.NewFlagSet("interactive", flag.ExitOnError)
-	var (
-		flOsquerydPath = flagset.String(
-			"osqueryd_path",
-			"",
-			"The path to the oqueryd binary",
-		)
-		flOsqueryFlags arrayFlags
-	)
-
-	flagset.Var(&flOsqueryFlags, "osquery_flag", "Flags to pass to osquery (possibly overriding Launcher defaults)")
-
-	flagset.Usage = commandUsage(flagset, "interactive")
-	if err := flagset.Parse(args); err != nil {
+func runInteractive(systemMultiSlogger *multislogger.MultiSlogger, args []string) error {
+	opts, err := launcher.ParseOptions("interactive", args)
+	if err != nil {
 		return err
 	}
 
-	osquerydPath := *flOsquerydPath
-	if osquerydPath == "" {
-		osquerydPath = findOsquery()
-		if osquerydPath == "" {
-			return errors.New("Could not find osqueryd binary")
-		}
-		osquerydPath = autoupdate.FindNewest(context.Background(), osquerydPath)
+	// here we are looking for the launcher "proper" root directory so that we know where
+	// to find the kv.sqlite where we can pull the auto table construction config from
+	if opts.RootDirectory == "" {
+		opts.RootDirectory = launcher.DefaultPath(launcher.RootDirectory)
 	}
 
-	// have to keep tempdir name short so we don't exceed socket length
-	rootDir, err := agent.MkdirTemp("launcher-interactive")
+	slogLevel := slog.LevelInfo
+	if opts.Debug {
+		slogLevel = slog.LevelDebug
+	}
+
+	// Add handler to write to stdout
+	systemMultiSlogger.AddHandler(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     slogLevel,
+		AddSource: true,
+	}))
+
+	if opts.OsquerydPath == "" {
+		latestOsquerydBinary, err := tuf.CheckOutLatestWithoutConfig("osqueryd", systemMultiSlogger.Logger)
+		if err != nil {
+			opts.OsquerydPath = launcher.FindOsquery()
+			if opts.OsquerydPath == "" {
+				return errors.New("could not find osqueryd binary")
+			}
+
+			return fmt.Errorf("finding osqueryd binary: %w", err)
+		} else {
+			opts.OsquerydPath = latestOsquerydBinary.Path
+		}
+	}
+
+	// this is a tmp root directory that launcher can use to store files it needs to run
+	// such as the osquery socket and augeas lense files
+	interactiveRootDir, err := agent.MkdirTemp("launcher-interactive")
 	if err != nil {
 		return fmt.Errorf("creating temp dir for interactive mode: %w", err)
 	}
 
 	defer func() {
-		if err := os.RemoveAll(rootDir); err != nil {
+		if err := os.RemoveAll(interactiveRootDir); err != nil {
 			fmt.Printf("error removing launcher interactive temp dir: %s\n", err)
 		}
 	}()
 
 	hasTlsServerCertsOsqueryFlag := false
 	// check to see if we were passed a tls_server_certs flag
-	for _, v := range flOsqueryFlags {
+	for _, v := range opts.OsqueryFlags {
 		if strings.HasPrefix(v, "tls_server_certs") {
 			hasTlsServerCertsOsqueryFlag = true
 			break
@@ -64,15 +80,20 @@ func runInteractive(args []string) error {
 
 	// if we were not passed a tls_server_certs flag, pass default to osquery
 	if !hasTlsServerCertsOsqueryFlag {
-		certs, err := internal.InstallCaCerts(rootDir)
+		certs, err := internal.InstallCaCerts(interactiveRootDir)
 		if err != nil {
 			return fmt.Errorf("installing CA certs: %w", err)
 		}
 
-		flOsqueryFlags = append(flOsqueryFlags, fmt.Sprintf("tls_server_certs=%s", certs))
+		opts.OsqueryFlags = append(opts.OsqueryFlags, fmt.Sprintf("tls_server_certs=%s", certs))
 	}
 
-	osqueryProc, extensionsServer, err := interactive.StartProcess(rootDir, osquerydPath, flOsqueryFlags)
+	fcOpts := []flags.Option{flags.WithCmdLineOpts(opts)}
+	flagController := flags.NewFlagController(systemMultiSlogger.Logger, inmemory.NewStore(), fcOpts...)
+
+	knapsack := knapsack.New(nil, flagController, nil, systemMultiSlogger, nil)
+
+	osqueryProc, extensionsServer, err := interactive.StartProcess(knapsack, interactiveRootDir)
 	if err != nil {
 		return fmt.Errorf("error starting osqueryd: %s", err)
 	}

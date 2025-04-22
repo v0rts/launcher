@@ -1,19 +1,25 @@
+//go:build darwin
+// +build darwin
+
 package table
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
+	"log/slog"
 	"strconv"
 	"time"
 
-	"github.com/go-kit/kit/log"
 	"github.com/groob/plist"
+	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/allowedcmd"
+	"github.com/kolide/launcher/ee/tables/tablewrapper"
+	"github.com/kolide/launcher/pkg/traces"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
-func MDMInfo(logger log.Logger) *table.Plugin {
+func MDMInfo(flags types.Flags, slogger *slog.Logger) *table.Plugin {
 	columns := []table.ColumnDefinition{
 		table.TextColumn("enrolled"),
 		table.TextColumn("server_url"),
@@ -28,10 +34,13 @@ func MDMInfo(logger log.Logger) *table.Plugin {
 		table.TextColumn("installed_from_dep"),
 		table.TextColumn("user_approved"),
 	}
-	return table.NewPlugin("kolide_mdm_info", columns, generateMDMInfo)
+	return tablewrapper.New(flags, slogger, "kolide_mdm_info", columns, generateMDMInfo)
 }
 
 func generateMDMInfo(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
+	ctx, span := traces.StartSpan(ctx, "table_name", "kolide_mdm_info")
+	defer span.End()
+
 	profiles, err := getMDMProfile(ctx)
 	if err != nil {
 		return nil, err
@@ -86,10 +95,16 @@ func generateMDMInfo(ctx context.Context, queryContext table.QueryContext) ([]ma
 }
 
 func getMDMProfile(ctx context.Context) (*profilesOutput, error) {
+	ctx, span := traces.StartSpan(ctx)
+	defer span.End()
+
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "/usr/bin/profiles", "-L", "-o", "stdout-xml")
+	cmd, err := allowedcmd.Profiles(ctx, "-L", "-o", "stdout-xml")
+	if err != nil {
+		return nil, fmt.Errorf("creating profiles command: %w", err)
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("calling /usr/bin/profiles to get MDM profile payload: %w", err)
@@ -129,10 +144,16 @@ type payloadContent struct {
 }
 
 func getMDMProfileStatus(ctx context.Context) (profileStatus, error) {
+	ctx, span := traces.StartSpan(ctx)
+	defer span.End()
+
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "/usr/bin/profiles", "status", "-type", "enrollment")
+	cmd, err := allowedcmd.Profiles(ctx, "status", "-type", "enrollment")
+	if err != nil {
+		return profileStatus{}, fmt.Errorf("creating profiles command: %w", err)
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return profileStatus{}, fmt.Errorf("calling /usr/bin/profiles to get MDM profile status: %w", err)

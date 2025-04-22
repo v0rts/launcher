@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/kolide/launcher/pkg/log/multislogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -28,11 +28,11 @@ func TestStartDebugServer(t *testing.T) {
 	tokenFile, err := os.CreateTemp("", "kolide_debug_test")
 	require.Nil(t, err)
 
-	serv, err := startDebugServer(tokenFile.Name(), log.NewNopLogger())
+	serv, err := startDebugServer(tokenFile.Name(), multislogger.NewNopLogger())
 	require.Nil(t, err)
 
 	url := getDebugURL(t, tokenFile.Name())
-	resp, err := http.Get(url)
+	resp, err := http.Get(url) //nolint:noctx // We don't care about this in tests
 	require.Nil(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	resp.Body.Close()
@@ -46,11 +46,11 @@ func TestDebugServerUnauthorized(t *testing.T) {
 	tokenFile, err := os.CreateTemp("", "kolide_debug_test")
 	require.Nil(t, err)
 
-	serv, err := startDebugServer(tokenFile.Name(), log.NewNopLogger())
+	serv, err := startDebugServer(tokenFile.Name(), multislogger.NewNopLogger())
 	require.Nil(t, err)
 
 	url := getDebugURL(t, tokenFile.Name())
-	resp, err := http.Get(url + "bad_token")
+	resp, err := http.Get(url + "bad_token") //nolint:noctx // We don't care about this in tests
 	require.Nil(t, err)
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	resp.Body.Close()
@@ -65,14 +65,14 @@ func TestAttachDebugHandler(t *testing.T) {
 	tokenFile, err := os.CreateTemp("", "kolide_debug_test")
 	require.Nil(t, err)
 
-	AttachDebugHandler(tokenFile.Name(), log.NewNopLogger())
+	AttachDebugHandler(tokenFile.Name(), multislogger.NewNopLogger())
 
 	// Start server
 	syscall.Kill(syscall.Getpid(), debugSignal)
 	time.Sleep(1 * time.Second)
 
 	url := getDebugURL(t, tokenFile.Name())
-	resp, err := http.Get(url)
+	resp, err := http.Get(url) //nolint:noctx // We don't care about this in tests
 	require.Nil(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	defer resp.Body.Close()
@@ -81,7 +81,7 @@ func TestAttachDebugHandler(t *testing.T) {
 	syscall.Kill(syscall.Getpid(), debugSignal)
 	time.Sleep(1 * time.Second)
 
-	_, err = http.Get(url)
+	_, err = http.Get(url) //nolint:noctx // We don't care about this in tests
 	require.NotNil(t, err)
 
 	// Start server
@@ -91,7 +91,7 @@ func TestAttachDebugHandler(t *testing.T) {
 	newUrl := getDebugURL(t, tokenFile.Name())
 	assert.NotEqual(t, url, newUrl)
 
-	_, err = http.Get(newUrl)
+	_, err = http.Get(newUrl) //nolint:noctx // We don't care about this in tests
 	require.Nil(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	resp.Body.Close()
@@ -100,6 +100,6 @@ func TestAttachDebugHandler(t *testing.T) {
 	syscall.Kill(syscall.Getpid(), debugSignal)
 	time.Sleep(1 * time.Second)
 
-	_, err = http.Get(url)
+	_, err = http.Get(url) //nolint:noctx // We don't care about this in tests
 	require.NotNil(t, err)
 }

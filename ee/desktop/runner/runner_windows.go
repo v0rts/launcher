@@ -5,16 +5,23 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"syscall"
 
 	"github.com/kolide/launcher/ee/consoleuser"
+	"github.com/kolide/launcher/pkg/traces"
+	"github.com/kolide/systray"
 )
 
 func (r *DesktopUsersProcessesRunner) runAsUser(ctx context.Context, uid string, cmd *exec.Cmd) error {
+	ctx, span := traces.StartSpan(ctx, "uid", uid)
+	defer span.End()
+
 	explorerProc, err := consoleuser.ExplorerProcess(ctx, uid)
-	if err != nil {
+	if err != nil || explorerProc == nil {
 		return fmt.Errorf("getting user explorer process: %w", err)
 	}
 
@@ -54,4 +61,18 @@ func processAccessToken(pid int32) (syscall.Token, error) {
 	}
 
 	return token, err
+}
+
+func osversion() (string, error) {
+	return "", errors.New("not implemented")
+}
+
+// logIndicatesSystrayNeedsRestart checks to see if the log line contains
+// "tray not ready yet", which indicates that the systray had an irrecoverable
+// error during initialization and requires restart. Sometimes the tray may
+// also fail to initialize with "Unspecified error", so we check for the generic
+// initialization failed message as well.
+func logIndicatesSystrayNeedsRestart(logLine string) bool {
+	return strings.Contains(logLine, systray.ErrTrayNotReadyYet.Error()) ||
+		strings.Contains(logLine, "systray error: unable to init instance")
 }
