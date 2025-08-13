@@ -35,7 +35,7 @@ type Runner struct {
 	settingsWriter  settingsStoreWriter     // writes to startup settings store
 	opts            []OsqueryInstanceOption // global options applying to all osquery instances
 	shutdown        chan struct{}
-	interrupted     atomic.Bool
+	interrupted     *atomic.Bool
 }
 
 func New(k types.Knapsack, serviceClient service.KolideService, settingsWriter settingsStoreWriter, opts ...OsqueryInstanceOption) *Runner {
@@ -48,6 +48,7 @@ func New(k types.Knapsack, serviceClient service.KolideService, settingsWriter s
 		settingsWriter:  settingsWriter,
 		shutdown:        make(chan struct{}),
 		opts:            opts,
+		interrupted:     &atomic.Bool{},
 	}
 
 	k.RegisterChangeObserver(runner,
@@ -66,8 +67,10 @@ func (r *Runner) Run() error {
 		id := registrationId
 		wg.Go(func() error {
 			if err := r.runInstance(id); err != nil {
-				r.slogger.Log(ctx, slog.LevelWarn,
-					"runner terminated running osquery instance unexpectedly, shutting down runner",
+				// This is likely due to calling runner.Interrupt -- if not, the error will have
+				// already been logged at the error level in r.runInstance
+				r.slogger.Log(ctx, slog.LevelInfo,
+					"instance terminated, proceeding with runner shutdown",
 					"err", err,
 				)
 
@@ -115,6 +118,8 @@ func (r *Runner) runInstance(registrationId string) error {
 			"osquery instance exited",
 		)
 
+		observability.OsqueryRestartCounter.Add(ctx, 1)
+
 		select {
 		case <-r.shutdown:
 			// Intentional shutdown of runner -- exit worker
@@ -125,11 +130,12 @@ func (r *Runner) runInstance(registrationId string) error {
 
 		// The osquery instance either exited on its own, or we called `Restart`.
 		// Either way, we wait for exit to complete, and then restart the instance.
-		err := instance.WaitShutdown(ctx)
-		slogger.Log(context.TODO(), slog.LevelInfo,
-			"unexpected restart of instance",
-			"err", err,
-		)
+		if err := instance.WaitShutdown(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			slogger.Log(context.TODO(), slog.LevelError,
+				"received error on instance shutdown after instance exit or instance restart",
+				"err", err,
+			)
+		}
 
 		var launchErr error
 		instance, launchErr = r.launchInstanceWithRetries(ctx, registrationId)
@@ -219,12 +225,11 @@ func (r *Runner) Shutdown() error {
 	ctx, span := observability.StartSpan(context.TODO())
 	defer span.End()
 
-	if r.interrupted.Load() {
+	if r.interrupted.Swap(true) {
 		// Already shut down, nothing else to do
 		return nil
 	}
 
-	r.interrupted.Store(true)
 	close(r.shutdown)
 
 	if err := r.triggerShutdownForInstances(ctx); err != nil {

@@ -61,6 +61,7 @@ func TestCreateOsqueryCommand(t *testing.T) {
 	}
 
 	osquerydPath := testOsqueryBinary
+	rootDir := t.TempDir()
 
 	k := typesMocks.NewKnapsack(t)
 	k.On("WatchdogEnabled").Return(true)
@@ -70,7 +71,7 @@ func TestCreateOsqueryCommand(t *testing.T) {
 	k.On("OsqueryVerbose").Return(true)
 	k.On("OsqueryFlags").Return([]string{})
 	k.On("Slogger").Return(multislogger.NewNopLogger())
-	k.On("RootDirectory").Return("")
+	k.On("RootDirectory").Return(rootDir)
 	setupHistory(t, k)
 
 	i := newInstance(types.DefaultRegistrationID, k, mockServiceClient(t), settingsstoremock.NewSettingsStoreWriter(t))
@@ -85,6 +86,7 @@ func TestCreateOsqueryCommand(t *testing.T) {
 func TestCreateOsqueryCommandWithFlags(t *testing.T) {
 	t.Parallel()
 
+	rootDir := t.TempDir()
 	k := typesMocks.NewKnapsack(t)
 	k.On("WatchdogEnabled").Return(true)
 	k.On("WatchdogMemoryLimitMB").Return(150)
@@ -93,7 +95,7 @@ func TestCreateOsqueryCommandWithFlags(t *testing.T) {
 	k.On("OsqueryFlags").Return([]string{"verbose=false", "windows_event_channels=foo,bar"})
 	k.On("OsqueryVerbose").Return(true)
 	k.On("Slogger").Return(multislogger.NewNopLogger())
-	k.On("RootDirectory").Return("")
+	k.On("RootDirectory").Return(rootDir)
 	setupHistory(t, k)
 
 	i := newInstance(types.DefaultRegistrationID, k, mockServiceClient(t), settingsstoremock.NewSettingsStoreWriter(t))
@@ -118,6 +120,7 @@ func TestCreateOsqueryCommandWithFlags(t *testing.T) {
 func TestCreateOsqueryCommand_SetsEnabledWatchdogSettingsAppropriately(t *testing.T) {
 	t.Parallel()
 
+	rootDir := t.TempDir()
 	k := typesMocks.NewKnapsack(t)
 	k.On("WatchdogEnabled").Return(true)
 	k.On("WatchdogMemoryLimitMB").Return(150)
@@ -126,7 +129,7 @@ func TestCreateOsqueryCommand_SetsEnabledWatchdogSettingsAppropriately(t *testin
 	k.On("Slogger").Return(multislogger.NewNopLogger())
 	k.On("OsqueryVerbose").Return(true)
 	k.On("OsqueryFlags").Return([]string{})
-	k.On("RootDirectory").Return("")
+	k.On("RootDirectory").Return(rootDir)
 	setupHistory(t, k)
 
 	i := newInstance(types.DefaultRegistrationID, k, mockServiceClient(t), settingsstoremock.NewSettingsStoreWriter(t))
@@ -170,12 +173,13 @@ func TestCreateOsqueryCommand_SetsEnabledWatchdogSettingsAppropriately(t *testin
 func TestCreateOsqueryCommand_SetsDisabledWatchdogSettingsAppropriately(t *testing.T) {
 	t.Parallel()
 
+	rootDir := t.TempDir()
 	k := typesMocks.NewKnapsack(t)
 	k.On("WatchdogEnabled").Return(false)
 	k.On("Slogger").Return(multislogger.NewNopLogger())
 	k.On("OsqueryVerbose").Return(true)
 	k.On("OsqueryFlags").Return([]string{})
-	k.On("RootDirectory").Return("")
+	k.On("RootDirectory").Return(rootDir)
 	setupHistory(t, k)
 
 	i := newInstance(types.DefaultRegistrationID, k, mockServiceClient(t), settingsstoremock.NewSettingsStoreWriter(t))
@@ -283,6 +287,7 @@ func TestHealthy(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	s := settingsstoremock.NewSettingsStoreWriter(t)
 	s.On("WriteSettings").Return(nil)
 	setupHistory(t, k)
@@ -375,9 +380,10 @@ func TestLaunch(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 
 	s := settingsstoremock.NewSettingsStoreWriter(t)
-	s.On("WriteSettings").Return(nil)
+	s.On("WriteSettings").Return(nil).Maybe()
 	osqHistory := setupHistory(t, k)
 
 	i := newInstance(types.DefaultRegistrationID, k, mockServiceClient(t), s)
@@ -447,10 +453,11 @@ func TestReloadKatcExtension(t *testing.T) {
 	require.NoError(t, err)
 	k.On("KatcConfigStore").Return(katcConfigStore).Maybe()
 	k.On("ConfigStore").Return(inmemory.NewStore()).Maybe()
+	k.On("RegistrationStore").Return(inmemory.NewStore()).Maybe()
 	k.On("LauncherHistoryStore").Return(inmemory.NewStore()).Maybe()
 	k.On("ServerProvidedDataStore").Return(inmemory.NewStore()).Maybe()
 	k.On("AgentFlagsStore").Return(inmemory.NewStore()).Maybe()
-	k.On("AutoupdateErrorsStore").Return(inmemory.NewStore()).Maybe()
+	k.On("WindowsUpdatesCacheStore").Return(inmemory.NewStore()).Maybe()
 	k.On("StatusLogsStore").Return(inmemory.NewStore()).Maybe()
 	k.On("ResultLogsStore").Return(inmemory.NewStore()).Maybe()
 	k.On("BboltDB").Return(storageci.SetupDB(t)).Maybe()
@@ -471,6 +478,7 @@ func TestReloadKatcExtension(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	s := settingsstoremock.NewSettingsStoreWriter(t)
 	s.On("WriteSettings").Return(nil)
 	osqHistory := setupHistory(t, k)

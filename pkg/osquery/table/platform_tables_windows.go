@@ -6,6 +6,8 @@ package table
 import (
 	"log/slog"
 
+	json "github.com/kolide/launcher/ee/tables/execparsers/json"
+
 	"github.com/kolide/launcher/ee/agent/types"
 	"github.com/kolide/launcher/ee/allowedcmd"
 	"github.com/kolide/launcher/ee/tables/dataflattentable"
@@ -26,7 +28,9 @@ func platformSpecificTables(k types.Knapsack, slogger *slog.Logger, currentOsque
 		wifi_networks.TablePlugin(k, slogger),
 		windowsupdatetable.TablePlugin(windowsupdatetable.UpdatesTable, k, slogger),
 		windowsupdatetable.TablePlugin(windowsupdatetable.HistoryTable, k, slogger),
+		windowsupdatetable.CachedWindowsUpdatesTablePlugin(k, slogger, k.WindowsUpdatesCacheStore()),
 		wmitable.TablePlugin(k, slogger),
 		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_dsregcmd", dsregcmd.Parser, allowedcmd.Dsregcmd, []string{`/status`}),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_zscaler", json.Parser, allowedcmd.Zscli, []string{"status", "-s", "all"}, dataflattentable.WithReportStderr(), dataflattentable.WithReportMissingBinary()),
 	}
 }

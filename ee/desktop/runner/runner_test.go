@@ -130,7 +130,7 @@ func TestDesktopUserProcessRunner_Execute(t *testing.T) {
 			mockKnapsack.On("DesktopMenuRefreshInterval").Return(time.Millisecond * 250)
 			mockKnapsack.On("KolideServerURL").Return("somewhere-over-the-rainbow.example.com")
 
-			// if were not in CI, always exepect desktop enabled call
+			// if we're not in CI, always expect desktop enabled call
 			// if we are in CI only expect desktop enabled on windows and darwin
 			// since linux CI has no desktop user to make desktop process for
 			if (runtime.GOOS == "windows" || runtime.GOOS == "darwin") || os.Getenv("CI") != "true" {
@@ -167,6 +167,7 @@ func TestDesktopUserProcessRunner_Execute(t *testing.T) {
 
 			// let it run a few intervals
 			time.Sleep(r.updateInterval * 6)
+			interruptStart := time.Now()
 			r.Interrupt(nil)
 
 			user, err := user.Current()
@@ -233,7 +234,7 @@ func TestDesktopUserProcessRunner_Execute(t *testing.T) {
 					receivedInterrupts += 1
 					continue
 				case <-time.After(5 * time.Second):
-					t.Errorf("could not call interrupt multiple times and return within 5 seconds -- received %d interrupts before timeout", receivedInterrupts)
+					t.Errorf("could not call interrupt multiple times and return within 5 seconds -- interrupted at %s, received %d interrupts before timeout; logs: \n%s\n", interruptStart.String(), receivedInterrupts, logBytes.String())
 					t.FailNow()
 				}
 			}

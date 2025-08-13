@@ -197,6 +197,7 @@ func TestWithOsqueryFlags(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	setUpMockStores(t, k)
 	osqHistory := setupHistory(t, k)
 
@@ -247,6 +248,7 @@ func TestFlagsChanged(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	setUpMockStores(t, k)
 	osqHistory := setupHistory(t, k)
 
@@ -353,19 +355,21 @@ func TestPing(t *testing.T) {
 	require.NoError(t, err)
 	k.On("KatcConfigStore").Return(katcConfigStore).Maybe()
 	k.On("ConfigStore").Return(inmemory.NewStore()).Maybe()
+	k.On("RegistrationStore").Return(inmemory.NewStore()).Maybe()
 	k.On("LauncherHistoryStore").Return(inmemory.NewStore()).Maybe()
 	k.On("ServerProvidedDataStore").Return(inmemory.NewStore()).Maybe()
 	k.On("AgentFlagsStore").Return(inmemory.NewStore()).Maybe()
-	k.On("AutoupdateErrorsStore").Return(inmemory.NewStore()).Maybe()
 	k.On("StatusLogsStore").Return(inmemory.NewStore()).Maybe()
 	k.On("ResultLogsStore").Return(inmemory.NewStore()).Maybe()
 	k.On("BboltDB").Return(storageci.SetupDB(t)).Maybe()
+	k.On("WindowsUpdatesCacheStore").Return(inmemory.NewStore()).Maybe()
 	osqHistory := setupHistory(t, k)
 	s := settingsstoremock.NewSettingsStoreWriter(t)
 	s.On("WriteSettings").Return(nil)
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 
 	// Start the runner
 	runner := New(k, mockServiceClient(t), s)
@@ -615,6 +619,7 @@ func TestSimplePath(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	setUpMockStores(t, k)
 	osqHistory := setupHistory(t, k)
 
@@ -665,6 +670,7 @@ func TestMultipleInstances(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	setUpMockStores(t, k)
 	osqHistory := setupHistory(t, k)
 	serviceClient := mockServiceClient(t)
@@ -748,6 +754,7 @@ func TestRunnerHandlesImmediateShutdownWithMultipleInstances(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	setUpMockStores(t, k)
 	osqHistory := setupHistory(t, k)
 	serviceClient := mockServiceClient(t)
@@ -826,6 +833,7 @@ func TestMultipleShutdowns(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	setUpMockStores(t, k)
 	osqHistory := setupHistory(t, k)
 
@@ -876,6 +884,7 @@ func TestOsqueryDies(t *testing.T) {
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	setUpMockStores(t, k)
 	osqHistory := setupHistory(t, k)
 
@@ -1048,6 +1057,7 @@ func setupOsqueryInstanceForTests(t *testing.T) (runner *Runner, logBytes *threa
 	k.On("DistributedForwardingInterval").Maybe().Return(60 * time.Second)
 	k.On("RegisterChangeObserver", mock.Anything, mock.Anything).Maybe().Return()
 	k.On("DeregisterChangeObserver", mock.Anything).Maybe().Return()
+	k.On("UseCachedDataForScheduledQueries").Return(true).Maybe()
 	setUpMockStores(t, k)
 	osqHistory = setupHistory(t, k)
 
@@ -1069,13 +1079,14 @@ func setUpMockStores(t *testing.T, k *typesMocks.Knapsack) {
 	require.NoError(t, err)
 	k.On("KatcConfigStore").Return(store).Maybe()
 	k.On("ConfigStore").Return(inmemory.NewStore()).Maybe()
+	k.On("RegistrationStore").Return(inmemory.NewStore()).Maybe()
 	k.On("LauncherHistoryStore").Return(inmemory.NewStore()).Maybe()
 	k.On("ServerProvidedDataStore").Return(inmemory.NewStore()).Maybe()
 	k.On("AgentFlagsStore").Return(inmemory.NewStore()).Maybe()
-	k.On("AutoupdateErrorsStore").Return(inmemory.NewStore()).Maybe()
 	k.On("StatusLogsStore").Return(inmemory.NewStore()).Maybe()
 	k.On("ResultLogsStore").Return(inmemory.NewStore()).Maybe()
 	k.On("BboltDB").Return(storageci.SetupDB(t)).Maybe()
+	k.On("WindowsUpdatesCacheStore").Return(inmemory.NewStore()).Maybe()
 }
 
 func setupHistory(t *testing.T, k *typesMocks.Knapsack) *history.History {

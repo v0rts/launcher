@@ -3,11 +3,13 @@ package exporter
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/kolide/kit/ulid"
 	"github.com/kolide/kit/version"
 	"github.com/kolide/launcher/ee/agent/flags/keys"
 	"github.com/kolide/launcher/ee/agent/storage"
@@ -16,6 +18,7 @@ import (
 	typesmocks "github.com/kolide/launcher/ee/agent/types/mocks"
 	"github.com/kolide/launcher/ee/observability/bufspanprocessor"
 	"github.com/kolide/launcher/pkg/log/multislogger"
+	"github.com/kolide/launcher/pkg/threadsafebuffer"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
@@ -24,7 +27,7 @@ import (
 // NB - Tests that result in calls to `setNewGlobalProvider` should not be run in parallel
 // to avoid race condition complaints.
 
-func TestNewTraceExporter(t *testing.T) { //nolint:paralleltest
+func TestNewTelemetryExporter(t *testing.T) { //nolint:paralleltest
 	mockKnapsack := typesmocks.NewKnapsack(t)
 
 	tokenStore := testTokenStore(t)
@@ -45,6 +48,8 @@ func TestNewTraceExporter(t *testing.T) { //nolint:paralleltest
 	mockKnapsack.On("TraceBatchTimeout").Return(1 * time.Minute)
 	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.ExportTraces, keys.TraceSamplingRate, keys.TraceIngestServerURL, keys.DisableTraceIngestTLS, keys.TraceBatchTimeout).Return(nil)
 	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
+	mockKnapsack.On("UpdateChannel").Return("nightly").Maybe()
+	mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
 	mockKnapsack.On("GetEnrollmentDetails").Return(types.EnrollmentDetails{
 		OsqueryVersion: "5.8.0",
 		OSName:         runtime.GOOS,
@@ -58,20 +63,20 @@ func TestNewTraceExporter(t *testing.T) { //nolint:paralleltest
 	// Wait a few seconds to allow the osquery queries to go through
 	time.Sleep(500 * time.Millisecond)
 
-	// We expect a total of 12 attributes: 3 initial attributes, 5 from the ServerProvidedDataStore, and 4 from osquery
+	// We expect a total of 13 attributes: 4 initial attributes, 5 from the ServerProvidedDataStore, and 4 from osquery
 	telemetryExporter.attrLock.RLock()
 	defer telemetryExporter.attrLock.RUnlock()
-	require.Equal(t, 12, len(telemetryExporter.attrs))
+	require.Equal(t, 17, len(telemetryExporter.attrs))
 
 	// Confirm we set a provider
 	telemetryExporter.providerLock.Lock()
 	defer telemetryExporter.providerLock.Unlock()
-	require.NotNil(t, telemetryExporter.tracerProvider, "expected provider to be created")
+	require.NotNil(t, telemetryExporter.tracerProvider, "expected tracer provider to be created")
 
 	mockKnapsack.AssertExpectations(t)
 }
 
-func TestNewTraceExporter_exportNotEnabled(t *testing.T) {
+func TestNewTelemetryExporter_exportNotEnabled(t *testing.T) {
 	t.Parallel()
 
 	tokenStore := testTokenStore(t)
@@ -84,16 +89,19 @@ func TestNewTraceExporter_exportNotEnabled(t *testing.T) {
 	mockKnapsack.On("TraceSamplingRate").Return(0.0)
 	mockKnapsack.On("TraceBatchTimeout").Return(1 * time.Minute)
 	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.ExportTraces, keys.TraceSamplingRate, keys.TraceIngestServerURL, keys.DisableTraceIngestTLS, keys.TraceBatchTimeout).Return(nil)
+	mockKnapsack.On("UpdateChannel").Return("alpha").Maybe()
+	mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
 	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
 
 	telemetryExporter, err := NewTelemetryExporter(context.Background(), mockKnapsack, nil)
 	require.NoError(t, err)
 
 	// Confirm we didn't set a provider
-	require.Nil(t, telemetryExporter.tracerProvider, "expected disabled exporter to not create a provider but one was created")
+	require.Nil(t, telemetryExporter.tracerProvider, "expected disabled exporter to not create a tracer provider but one was created")
+	require.Nil(t, telemetryExporter.meterProvider, "expected disabled exporter to not create a meter provider but one was created")
 
 	// Confirm we added basic attributes
-	require.Equal(t, 3, len(telemetryExporter.attrs))
+	require.Equal(t, 4, len(telemetryExporter.attrs))
 	for _, actualAttr := range telemetryExporter.attrs {
 		switch actualAttr.Key {
 		case "service.name":
@@ -102,6 +110,8 @@ func TestNewTraceExporter_exportNotEnabled(t *testing.T) {
 			require.Equal(t, version.Version().Version, actualAttr.Value.AsString())
 		case "host.arch":
 			require.Equal(t, runtime.GOARCH, actualAttr.Value.AsString())
+		case "launcher.goos":
+			require.Equal(t, runtime.GOOS, actualAttr.Value.AsString())
 		default:
 			t.Fatalf("unexpected attr %s", actualAttr.Key)
 		}
@@ -121,7 +131,13 @@ func TestInterrupt_Multiple(t *testing.T) { //nolint:paralleltest
 	mockKnapsack.On("TraceSamplingRate").Return(0.0)
 	mockKnapsack.On("TraceBatchTimeout").Return(1 * time.Minute)
 	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.ExportTraces, keys.TraceSamplingRate, keys.TraceIngestServerURL, keys.DisableTraceIngestTLS, keys.TraceBatchTimeout).Return(nil)
-	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
+	mockKnapsack.On("UpdateChannel").Return("beta").Maybe()
+	mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
+	var logBytes threadsafebuffer.ThreadSafeBuffer
+	slogger := slog.New(slog.NewTextHandler(&logBytes, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	mockKnapsack.On("Slogger").Return(slogger)
 
 	telemetryExporter, err := NewTelemetryExporter(context.Background(), mockKnapsack, NewInitialTraceBuffer())
 	require.NoError(t, err)
@@ -129,6 +145,7 @@ func TestInterrupt_Multiple(t *testing.T) { //nolint:paralleltest
 
 	go telemetryExporter.Execute()
 	time.Sleep(3 * time.Second)
+	interruptStart := time.Now()
 	telemetryExporter.Interrupt(errors.New("test error"))
 
 	// Confirm we can call Interrupt multiple times without blocking
@@ -152,7 +169,7 @@ func TestInterrupt_Multiple(t *testing.T) { //nolint:paralleltest
 			receivedInterrupts += 1
 			continue
 		case <-time.After(5 * time.Second):
-			t.Errorf("could not call interrupt multiple times and return within 5 seconds -- received %d interrupts before timeout", receivedInterrupts)
+			t.Errorf("could not call interrupt multiple times and return within 5 seconds -- interrupted at %s, received %d interrupts before timeout; logs: \n%s\n", interruptStart.String(), receivedInterrupts, logBytes.String())
 			t.FailNow()
 		}
 	}
@@ -180,6 +197,12 @@ func Test_addDeviceIdentifyingAttributes(t *testing.T) {
 	expectedSerialNumber := "abcd"
 	s.Set([]byte("serial_number"), []byte(expectedSerialNumber))
 
+	expectedUpdateChannel := "stable"
+	mockKnapsack.On("UpdateChannel").Return(expectedUpdateChannel)
+
+	expectedRunId := ulid.New()
+	mockKnapsack.On("GetRunID").Return(expectedRunId)
+
 	traceExporter := &TelemetryExporter{
 		knapsack:                  mockKnapsack,
 		slogger:                   multislogger.NewNopLogger(),
@@ -196,7 +219,7 @@ func Test_addDeviceIdentifyingAttributes(t *testing.T) {
 	traceExporter.addDeviceIdentifyingAttributes()
 
 	// Confirm all expected attributes were added
-	require.Equal(t, 5, len(traceExporter.attrs))
+	require.Equal(t, 9, len(traceExporter.attrs))
 	for _, actualAttr := range traceExporter.attrs {
 		switch actualAttr.Key {
 		case "service.instance.id", "k2.device_id":
@@ -207,6 +230,12 @@ func Test_addDeviceIdentifyingAttributes(t *testing.T) {
 			require.Equal(t, expectedOrganizationId, actualAttr.Value.AsString())
 		case "launcher.serial":
 			require.Equal(t, expectedSerialNumber, actualAttr.Value.AsString())
+		case "launcher.update_channel":
+			require.Equal(t, expectedUpdateChannel, actualAttr.Value.AsString())
+		case "launcher.run_id":
+			require.Equal(t, expectedRunId, actualAttr.Value.AsString())
+		case "process.pid", "process.executable.path":
+			// Not going to validate attr values, but we do expect to have them
 		default:
 			t.Fatalf("unexpected attr %s", actualAttr.Key)
 		}
@@ -275,10 +304,12 @@ func TestPing(t *testing.T) {
 	s := testTokenStore(t)
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("TokenStore").Return(s)
+	mockKnapsack.On("UpdateChannel").Return("nightly").Maybe()
+	mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
 
 	traceExporter := &TelemetryExporter{
 		knapsack:                  mockKnapsack,
-		bufSpanProcessor:          &bufspanprocessor.BufSpanProcessor{},
+		bufSpanProcessor:          bufspanprocessor.NewBufSpanProcessor(500),
 		slogger:                   multislogger.NewNopLogger(),
 		attrs:                     make([]attribute.KeyValue, 0),
 		attrLock:                  sync.RWMutex{},
@@ -345,6 +376,8 @@ func TestFlagsChanged_ExportTraces(t *testing.T) { //nolint:paralleltest
 			s := testServerProvidedDataStore(t)
 			mockKnapsack := typesmocks.NewKnapsack(t)
 			mockKnapsack.On("ExportTraces").Return(tt.newEnableValue)
+			mockKnapsack.On("UpdateChannel").Return("nightly").Maybe()
+			mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
 
 			if tt.shouldReplaceProvider {
 				mockKnapsack.On("TraceIngestServerURL").Return("https://example.com")
@@ -363,7 +396,7 @@ func TestFlagsChanged_ExportTraces(t *testing.T) { //nolint:paralleltest
 			ctx, cancel := context.WithCancel(context.Background())
 			traceExporter := &TelemetryExporter{
 				knapsack:                  mockKnapsack,
-				bufSpanProcessor:          &bufspanprocessor.BufSpanProcessor{},
+				bufSpanProcessor:          bufspanprocessor.NewBufSpanProcessor(500),
 				slogger:                   multislogger.NewNopLogger(),
 				attrs:                     make([]attribute.KeyValue, 0),
 				attrLock:                  sync.RWMutex{},
@@ -385,6 +418,7 @@ func TestFlagsChanged_ExportTraces(t *testing.T) { //nolint:paralleltest
 				mockKnapsack.AssertExpectations(t)
 				require.Greater(t, len(traceExporter.attrs), 0)
 				require.NotNil(t, traceExporter.tracerProvider)
+				require.NotNil(t, traceExporter.meterProvider)
 			}
 		})
 	}
@@ -426,6 +460,8 @@ func TestFlagsChanged_TraceSamplingRate(t *testing.T) { //nolint:paralleltest
 		t.Run(tt.testName, func(t *testing.T) {
 			mockKnapsack := typesmocks.NewKnapsack(t)
 			mockKnapsack.On("TraceSamplingRate").Return(tt.newTraceSamplingRate)
+			mockKnapsack.On("UpdateChannel").Return("nightly").Maybe()
+			mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
 
 			if tt.shouldReplaceProvider {
 				mockKnapsack.On("TraceIngestServerURL").Return("https://example.com")
@@ -434,7 +470,7 @@ func TestFlagsChanged_TraceSamplingRate(t *testing.T) { //nolint:paralleltest
 			ctx, cancel := context.WithCancel(context.Background())
 			traceExporter := &TelemetryExporter{
 				knapsack:                  mockKnapsack,
-				bufSpanProcessor:          &bufspanprocessor.BufSpanProcessor{},
+				bufSpanProcessor:          bufspanprocessor.NewBufSpanProcessor(500),
 				slogger:                   multislogger.NewNopLogger(),
 				attrs:                     make([]attribute.KeyValue, 0),
 				attrLock:                  sync.RWMutex{},
@@ -454,8 +490,10 @@ func TestFlagsChanged_TraceSamplingRate(t *testing.T) { //nolint:paralleltest
 
 			if tt.shouldReplaceProvider {
 				require.NotNil(t, traceExporter.tracerProvider)
+				require.NotNil(t, traceExporter.meterProvider)
 			} else {
 				require.Nil(t, traceExporter.tracerProvider)
+				require.Nil(t, traceExporter.meterProvider)
 			}
 		})
 	}
@@ -498,11 +536,13 @@ func TestFlagsChanged_TraceIngestServerURL(t *testing.T) { //nolint:paralleltest
 		t.Run(tt.testName, func(t *testing.T) {
 			mockKnapsack := typesmocks.NewKnapsack(t)
 			mockKnapsack.On("TraceIngestServerURL").Return(tt.newObservabilityIngestServerURL)
+			mockKnapsack.On("UpdateChannel").Return("nightly").Maybe()
+			mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
 
 			ctx, cancel := context.WithCancel(context.Background())
 			traceExporter := &TelemetryExporter{
 				knapsack:                  mockKnapsack,
-				bufSpanProcessor:          &bufspanprocessor.BufSpanProcessor{},
+				bufSpanProcessor:          bufspanprocessor.NewBufSpanProcessor(500),
 				slogger:                   multislogger.NewNopLogger(),
 				attrs:                     make([]attribute.KeyValue, 0),
 				attrLock:                  sync.RWMutex{},
@@ -522,8 +562,10 @@ func TestFlagsChanged_TraceIngestServerURL(t *testing.T) { //nolint:paralleltest
 
 			if tt.shouldReplaceProvider {
 				require.NotNil(t, traceExporter.tracerProvider)
+				require.NotNil(t, traceExporter.meterProvider)
 			} else {
 				require.Nil(t, traceExporter.tracerProvider)
+				require.Nil(t, traceExporter.meterProvider)
 			}
 		})
 	}
@@ -565,6 +607,8 @@ func TestFlagsChanged_DisableTraceIngestTLS(t *testing.T) { //nolint:paralleltes
 		t.Run(tt.testName, func(t *testing.T) {
 			mockKnapsack := typesmocks.NewKnapsack(t)
 			mockKnapsack.On("DisableTraceIngestTLS").Return(tt.newDisableTraceIngestTLS)
+			mockKnapsack.On("UpdateChannel").Return("nightly").Maybe()
+			mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
 
 			if tt.shouldReplaceProvider {
 				mockKnapsack.On("TraceIngestServerURL").Return("https://example.com")
@@ -575,7 +619,7 @@ func TestFlagsChanged_DisableTraceIngestTLS(t *testing.T) { //nolint:paralleltes
 			ctx, cancel := context.WithCancel(context.Background())
 			traceExporter := &TelemetryExporter{
 				knapsack:                  mockKnapsack,
-				bufSpanProcessor:          &bufspanprocessor.BufSpanProcessor{},
+				bufSpanProcessor:          bufspanprocessor.NewBufSpanProcessor(500),
 				slogger:                   multislogger.NewNopLogger(),
 				attrs:                     make([]attribute.KeyValue, 0),
 				attrLock:                  sync.RWMutex{},
@@ -596,8 +640,10 @@ func TestFlagsChanged_DisableTraceIngestTLS(t *testing.T) { //nolint:paralleltes
 
 			if tt.shouldReplaceProvider {
 				require.NotNil(t, traceExporter.tracerProvider)
+				require.NotNil(t, traceExporter.meterProvider)
 			} else {
 				require.Nil(t, traceExporter.tracerProvider)
+				require.Nil(t, traceExporter.meterProvider)
 			}
 		})
 	}
@@ -639,6 +685,8 @@ func TestFlagsChanged_TraceBatchTimeout(t *testing.T) { //nolint:paralleltest
 		t.Run(tt.testName, func(t *testing.T) {
 			mockKnapsack := typesmocks.NewKnapsack(t)
 			mockKnapsack.On("TraceBatchTimeout").Return(tt.newBatchTimeout)
+			mockKnapsack.On("UpdateChannel").Return("nightly").Maybe()
+			mockKnapsack.On("GetRunID").Return(ulid.New()).Maybe()
 
 			if tt.shouldReplaceProvider {
 				mockKnapsack.On("TraceIngestServerURL").Return("https://example.com")
@@ -647,7 +695,7 @@ func TestFlagsChanged_TraceBatchTimeout(t *testing.T) { //nolint:paralleltest
 			ctx, cancel := context.WithCancel(context.Background())
 			traceExporter := &TelemetryExporter{
 				knapsack:                  mockKnapsack,
-				bufSpanProcessor:          &bufspanprocessor.BufSpanProcessor{},
+				bufSpanProcessor:          bufspanprocessor.NewBufSpanProcessor(500),
 				slogger:                   multislogger.NewNopLogger(),
 				attrs:                     make([]attribute.KeyValue, 0),
 				attrLock:                  sync.RWMutex{},
@@ -668,8 +716,10 @@ func TestFlagsChanged_TraceBatchTimeout(t *testing.T) { //nolint:paralleltest
 
 			if tt.shouldReplaceProvider {
 				require.NotNil(t, traceExporter.tracerProvider)
+				require.NotNil(t, traceExporter.meterProvider)
 			} else {
 				require.Nil(t, traceExporter.tracerProvider)
+				require.Nil(t, traceExporter.meterProvider)
 			}
 		})
 	}

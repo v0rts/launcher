@@ -6,7 +6,6 @@ type Stores interface {
 	Stores() map[storage.Store]KVStore
 	AgentFlagsStore() KVStore
 	KatcConfigStore() KVStore
-	AutoupdateErrorsStore() KVStore
 	ConfigStore() KVStore
 	ControlStore() KVStore
 	PersistentHostDataStore() KVStore
@@ -19,4 +18,6 @@ type Stores interface {
 	TokenStore() KVStore
 	LauncherHistoryStore() KVStore
 	Dt4aInfoStore() KVStore
+	WindowsUpdatesCacheStore() KVStore
+	RegistrationStore() KVStore
 }

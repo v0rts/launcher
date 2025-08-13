@@ -41,11 +41,9 @@ func (m *macNotifier) Execute() error {
 }
 
 func (m *macNotifier) Interrupt(err error) {
-	if m.interrupted.Load() {
+	if m.interrupted.Swap(true) {
 		return
 	}
-
-	m.interrupted.Store(true)
 
 	m.interrupt <- struct{}{}
 }
@@ -72,6 +70,8 @@ func (m *macNotifier) SendNotification(n Notification) error {
 
 	success := C.sendNotification(titleCStr, bodyCStr, actionUriCStr)
 	if !success {
+		// We don't need to log the lack of success here -- `C.sendNotification`
+		// performs an NSLog with the actual error in it.
 		return fmt.Errorf("could not send notification: %s", n.Title)
 	}
 

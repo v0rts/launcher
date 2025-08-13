@@ -20,7 +20,6 @@ func MakeStores(t *testing.T, slogger *slog.Logger, db *bbolt.DB) (map[storage.S
 	var storeNames = []storage.Store{
 		storage.AgentFlagsStore,
 		storage.KatcConfigStore,
-		storage.AutoupdateErrorsStore,
 		storage.ConfigStore,
 		storage.ControlStore,
 		storage.PersistentHostDataStore,
@@ -33,6 +32,8 @@ func MakeStores(t *testing.T, slogger *slog.Logger, db *bbolt.DB) (map[storage.S
 		storage.TokenStore,
 		storage.LauncherHistoryStore,
 		storage.Dt4aInfoStore,
+		storage.WindowsUpdatesCacheStore,
+		storage.RegistrationStore,
 	}
 
 	if os.Getenv("CI") == "true" {

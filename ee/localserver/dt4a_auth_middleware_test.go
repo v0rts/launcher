@@ -21,6 +21,11 @@ import (
 	"golang.org/x/crypto/nacl/box"
 )
 
+const (
+	testAccountId = "some_account"
+	testUserId    = "some_user"
+)
+
 func Test_Dt4aAuthMiddleware(t *testing.T) {
 	rootTrustedEcKey := mustGenEcdsaKey(t)
 
@@ -35,6 +40,14 @@ func Test_Dt4aAuthMiddleware(t *testing.T) {
 	returnData := []byte("Congrats!, you got the data back!")
 
 	handler := dt4aMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, r.Header.Get(dt4aAccountUuidHeaderKey), testAccountId,
+			"should have account uuid header set",
+		)
+
+		require.Equal(t, r.Header.Get(dt4aUserUuidHeaderKey), testUserId,
+			"should have user uuid header set",
+		)
+
 		w.Write(returnData)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -300,7 +313,75 @@ func Test_ValidateCertChain(t *testing.T) {
 		require.Equal(t, chain.counterPartyPubEncryptionKey, pubEncryptionKey,
 			"counter party pub encryption key should get set in validate",
 		)
+
+		require.Equal(t, testAccountId, chain.accountUuid,
+			"account uuid should be set in validate",
+		)
+
+		require.Equal(t, testUserId, chain.userUuid,
+			"user uuid should be set in validate",
+		)
 	})
+}
+
+func Test_originIsAllowlisted(t *testing.T) {
+	t.Parallel()
+
+	type testCase struct {
+		testCaseName      string
+		requestOrigin     string
+		expectAllowlisted bool
+	}
+
+	testCases := []testCase{
+		{
+			testCaseName:      "empty origin",
+			requestOrigin:     "",
+			expectAllowlisted: true,
+		},
+		{
+			testCaseName:      "safari web extension",
+			requestOrigin:     "safari-web-extension://testtest",
+			expectAllowlisted: true,
+		},
+		{
+			testCaseName:      "1p prod",
+			requestOrigin:     "https://example.1password.com",
+			expectAllowlisted: true,
+		},
+		{
+			testCaseName:      "1p with .ca",
+			requestOrigin:     "https://example2.1password.ca",
+			expectAllowlisted: true,
+		},
+		{
+			testCaseName:      "1p with .eu",
+			requestOrigin:     "https://example3.1password.eu",
+			expectAllowlisted: true,
+		},
+		{
+			testCaseName:      "origin not on allowlist",
+			requestOrigin:     "https://example.com",
+			expectAllowlisted: false,
+		},
+	}
+
+	for allowlistedOrigin := range allowlistedDt4aOriginsLookup {
+		testCases = append(testCases, testCase{
+			testCaseName:      allowlistedOrigin,
+			requestOrigin:     allowlistedOrigin,
+			expectAllowlisted: true,
+		})
+	}
+
+	for _, tt := range testCases {
+		tt := tt
+		t.Run(tt.testCaseName, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.expectAllowlisted, originIsAllowlisted(tt.requestOrigin))
+		})
+	}
 }
 
 // newChain creates a new chain of keys, where each key signs the next key in the chain
@@ -336,10 +417,10 @@ func newChain(counterPartyPubEncryptionKey *[32]byte, ecdsaKeys ...*ecdsa.Privat
 		}
 
 		thisPayload := payload{
-			AccountUuid:    "some_account",
+			AccountUuid:    testAccountId,
 			DateTimeSigned: time.Now().Unix(),
 			PublicKey:      *childKey,
-			UserUuid:       "some_user",
+			UserUuid:       testUserId,
 			ExpirationDate: time.Now().Add(1 * time.Hour).Unix(),
 			Version:        1,
 		}

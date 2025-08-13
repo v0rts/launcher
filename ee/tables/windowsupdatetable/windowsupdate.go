@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	comshim "github.com/NozomiNetworks/go-comshim"
 	"github.com/kolide/launcher/ee/agent/types"
 	"github.com/kolide/launcher/ee/dataflatten"
 	"github.com/kolide/launcher/ee/observability"
@@ -22,7 +23,6 @@ import (
 	"github.com/kolide/launcher/ee/tables/tablewrapper"
 	"github.com/kolide/launcher/pkg/windows/windowsupdate"
 	"github.com/osquery/osquery-go/plugin/table"
-	"github.com/scjalliance/comshim"
 )
 
 // QueryResults is the data returned by execing `launcher.exe query-windowsupdates`.
@@ -38,6 +38,8 @@ type tableMode int
 const (
 	UpdatesTable tableMode = iota
 	HistoryTable
+
+	defaultLocale = "_default"
 )
 
 type Table struct {
@@ -105,38 +107,12 @@ func (t *Table) generateWithLauncherExec(ctx context.Context, queryContext table
 
 	var results []map[string]string
 
-	for _, locale := range tablehelpers.GetConstraints(queryContext, "locale", tablehelpers.WithDefaults("_default")) {
-		args := []string{
-			"query-windowsupdates",
-			"-locale", locale,
-			"-table_mode", strconv.Itoa(int(t.mode)),
-		}
-		cmd := exec.CommandContext(ctx, launcherPath, args...) //nolint:forbidigo // We can exec the current executable safely
-		cmd.Env = append(cmd.Env, "LAUNCHER_SKIP_UPDATES=TRUE")
-		out, err := cmd.CombinedOutput()
+	for _, locale := range tablehelpers.GetConstraints(queryContext, "locale", tablehelpers.WithDefaults(defaultLocale)) {
+		res, err := callQueryWindowsUpdatesSubcommand(ctx, launcherPath, locale, t.mode)
 		if err != nil {
 			t.slogger.Log(ctx, slog.LevelWarn,
-				"error running launcher query-windowsupdates",
+				"error running query windows updates subcommand",
 				"err", err,
-				"out", string(out),
-			)
-			continue
-		}
-
-		var res QueryResults
-		if err := json.Unmarshal(out, &res); err != nil {
-			t.slogger.Log(ctx, slog.LevelWarn,
-				"error unmarshalling results of running launcher query-windowsupdates",
-				"err", err,
-				"out", string(out),
-			)
-			continue
-		}
-
-		if res.ErrStr != "" {
-			t.slogger.Log(ctx, slog.LevelWarn,
-				"launcher query-windowsupdates contained error",
-				"err", res.ErrStr,
 			)
 			continue
 		}
@@ -166,6 +142,44 @@ func (t *Table) generateWithLauncherExec(ctx context.Context, queryContext table
 	}
 
 	return results, nil
+}
+
+// callQueryWindowsUpdatesSubcommand performs the required query by execing `launcher.exe query-windowsupdates`;
+// it unmarshals the results into the expected format. We perform the exec to handle a memory leak in the Search
+// function. If a timeout has been set on `ctx`, it will be respected by the underlying exec.
+func callQueryWindowsUpdatesSubcommand(ctx context.Context, launcherPath string, locale string, mode tableMode) (*QueryResults, error) {
+	ctx, span := observability.StartSpan(ctx, "locale", locale, "table_mode", int(mode))
+	defer span.End()
+
+	args := []string{
+		"query-windowsupdates",
+		"-locale", locale,
+		"-table_mode", strconv.Itoa(int(mode)),
+	}
+
+	cmd := exec.CommandContext(ctx, launcherPath, args...) //nolint:forbidigo // We can exec the current executable safely
+	cmd.Env = append(cmd.Env, "LAUNCHER_SKIP_UPDATES=TRUE")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		err = fmt.Errorf("running query-windowsupdates: output `%s`: %w", string(out), err)
+		observability.SetError(span, err)
+		return nil, err
+	}
+
+	var res QueryResults
+	if err := json.Unmarshal(out, &res); err != nil {
+		err = fmt.Errorf("unmarshalling results of running launcher query-windowsupdates: %w", err)
+		observability.SetError(span, err)
+		return nil, err
+	}
+
+	if res.ErrStr != "" {
+		err = fmt.Errorf("launcher query-windowsupdates returned error: %s", res.ErrStr)
+		observability.SetError(span, err)
+		return nil, err
+	}
+
+	return &res, nil
 }
 
 //nolint:unused
@@ -198,7 +212,10 @@ func (t *Table) searchLocale(ctx context.Context, locale string, queryContext ta
 	ctx, span := observability.StartSpan(ctx)
 	defer span.End()
 
-	comshim.Add(1)
+	if err := comshim.TryAdd(1); err != nil {
+		comshim.Done() // ensure we decrement the global shim counter that TryAdd increments immediately
+		return nil, fmt.Errorf("unable to init comshim: %w", err)
+	}
 	defer comshim.Done()
 
 	var results []map[string]string

@@ -3,6 +3,7 @@ package knapsack
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -101,6 +102,25 @@ func (k *knapsack) RegistrationIDs() []string {
 	return []string{types.DefaultRegistrationID}
 }
 
+func (k *knapsack) Registrations() ([]types.Registration, error) {
+	registrations := make([]types.Registration, 0)
+	registrationStore := k.getKVStore(storage.RegistrationStore)
+	if registrationStore == nil {
+		return nil, errors.New("no registration store")
+	}
+	if err := registrationStore.ForEach(func(k []byte, v []byte) error {
+		var r types.Registration
+		if err := json.Unmarshal(v, &r); err != nil {
+			return fmt.Errorf("unmarshalling registration %s: %w", string(k), err)
+		}
+		registrations = append(registrations, r)
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("fetching registrations from store: %w", err)
+	}
+	return registrations, nil
+}
+
 // InstanceStatuses returns the current status of each osquery instance.
 // It performs a healthcheck against each existing instance.
 func (k *knapsack) InstanceStatuses() map[string]types.InstanceStatus {
@@ -126,10 +146,6 @@ func (k *knapsack) AgentFlagsStore() types.KVStore {
 
 func (k *knapsack) KatcConfigStore() types.KVStore {
 	return k.getKVStore(storage.KatcConfigStore)
-}
-
-func (k *knapsack) AutoupdateErrorsStore() types.KVStore {
-	return k.getKVStore(storage.AutoupdateErrorsStore)
 }
 
 func (k *knapsack) ConfigStore() types.KVStore {
@@ -182,6 +198,14 @@ func (k *knapsack) LauncherHistoryStore() types.KVStore {
 
 func (k *knapsack) Dt4aInfoStore() types.KVStore {
 	return k.getKVStore(storage.Dt4aInfoStore)
+}
+
+func (k *knapsack) WindowsUpdatesCacheStore() types.KVStore {
+	return k.getKVStore(storage.WindowsUpdatesCacheStore)
+}
+
+func (k *knapsack) RegistrationStore() types.KVStore {
+	return k.getKVStore(storage.RegistrationStore)
 }
 
 func (k *knapsack) SetLauncherWatchdogEnabled(enabled bool) error {

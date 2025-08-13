@@ -22,10 +22,10 @@ type FlagController struct {
 	slogger         *slog.Logger
 	cmdLineOpts     *launcher.Options
 	agentFlagsStore types.KVStore
-	overrideMutex   sync.RWMutex
+	overrideMutex   *sync.RWMutex
 	overrides       map[keys.FlagKey]*Override
 	observers       map[types.FlagsChangeObserver][]keys.FlagKey
-	observersMutex  sync.RWMutex
+	observersMutex  *sync.RWMutex
 }
 
 func NewFlagController(slogger *slog.Logger, agentFlagsStore types.KVStore, opts ...Option) *FlagController {
@@ -34,7 +34,9 @@ func NewFlagController(slogger *slog.Logger, agentFlagsStore types.KVStore, opts
 		cmdLineOpts:     &launcher.Options{},
 		agentFlagsStore: agentFlagsStore,
 		observers:       make(map[types.FlagsChangeObserver][]keys.FlagKey),
+		observersMutex:  &sync.RWMutex{},
 		overrides:       make(map[keys.FlagKey]*Override),
+		overrideMutex:   &sync.RWMutex{},
 	}
 
 	for _, opt := range opts {
@@ -133,14 +135,21 @@ func (fc *FlagController) notifyObservers(ctx context.Context, flagKeys ...keys.
 	ctx, span := observability.StartSpan(ctx)
 	defer span.End()
 
+	// If we hold `fc.observersMutex` for the duration of this function, we can have a deadlock
+	// if any `observer.FlagsChanged` function results in calling `fc.RegisterChangeObserver`,
+	// which uses the same `fc.observersMutex`. Therefore, we create a copy of the current
+	// observers map here and release `fc.observersMutex` preemptively.
 	fc.observersMutex.RLock()
 	span.AddEvent("observers_lock_acquired")
-	defer func() {
-		fc.observersMutex.RUnlock()
-		span.AddEvent("observers_lock_released")
-	}()
-
+	currentObservers := make(map[types.FlagsChangeObserver][]keys.FlagKey)
 	for observer, observedKeys := range fc.observers {
+		currentObservers[observer] = make([]keys.FlagKey, len(observedKeys))
+		copy(currentObservers[observer], observedKeys)
+	}
+	fc.observersMutex.RUnlock()
+	span.AddEvent("observers_lock_released")
+
+	for observer, observedKeys := range currentObservers {
 		changedKeys := keys.Intersection(observedKeys, flagKeys)
 
 		if len(changedKeys) > 0 {
@@ -755,4 +764,55 @@ func (fc *FlagController) TableGenerateTimeout() time.Duration {
 		WithMin(30*time.Second),
 		WithMax(10*time.Minute),
 	).get(fc.getControlServerValue(keys.TableGenerateTimeout))
+}
+
+func (fc *FlagController) SetUseCachedDataForScheduledQueries(enabled bool) error {
+	return fc.setControlServerValue(keys.UseCachedDataForScheduledQueries, boolToBytes(enabled))
+}
+func (fc *FlagController) UseCachedDataForScheduledQueries() bool {
+	return NewBoolFlagValue(
+		WithDefaultBool(false),
+	).get(fc.getControlServerValue(keys.UseCachedDataForScheduledQueries))
+}
+
+func (fc *FlagController) SetCachedQueryResultsTTL(ttl time.Duration) error {
+	return fc.setControlServerValue(keys.CachedQueryResultsTTL, durationToBytes(ttl))
+}
+func (fc *FlagController) CachedQueryResultsTTL() time.Duration {
+	return NewDurationFlagValue(fc.slogger, keys.CachedQueryResultsTTL,
+		WithDefault(6*time.Hour),
+		WithMin(90*time.Minute),
+		WithMax(72*time.Hour),
+	).get(fc.getControlServerValue(keys.CachedQueryResultsTTL))
+}
+
+func (fc *FlagController) SetResetOnHardwareChangeEnabled(enabled bool) error {
+	return fc.setControlServerValue(keys.ResetOnHardwareChangeEnabled, boolToBytes(enabled))
+}
+func (fc *FlagController) ResetOnHardwareChangeEnabled() bool {
+	return NewBoolFlagValue(
+		WithDefaultBool(false),
+	).get(fc.getControlServerValue(keys.ResetOnHardwareChangeEnabled))
+}
+
+func (fc *FlagController) AutoupdateDownloadSplay() time.Duration {
+	return NewDurationFlagValue(fc.slogger, keys.AutoupdateDownloadSplay,
+		WithDefault(fc.cmdLineOpts.AutoupdateDownloadSplay),
+		WithMin(0*time.Second),
+		WithMax(72*time.Hour),
+	).get(fc.getControlServerValue(keys.AutoupdateDownloadSplay))
+}
+
+func (fc *FlagController) SetAutoupdateDownloadSplay(val time.Duration) error {
+	return fc.setControlServerValue(keys.AutoupdateDownloadSplay, durationToBytes(val))
+}
+
+func (fc *FlagController) SetPerformanceMonitoringEnabled(enabled bool) error {
+	return fc.setControlServerValue(keys.PerformanceMonitoringEnabled, boolToBytes(enabled))
+}
+
+func (fc *FlagController) PerformanceMonitoringEnabled() bool {
+	return NewBoolFlagValue(
+		WithDefaultBool(false),
+	).get(fc.getControlServerValue(keys.PerformanceMonitoringEnabled))
 }

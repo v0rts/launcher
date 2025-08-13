@@ -10,10 +10,17 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/kolide/krypto/pkg/echelper"
+	"github.com/kolide/launcher/ee/observability"
+)
+
+const (
+	dt4aAccountUuidHeaderKey = "X-DT4A-Account-Uuid"
+	dt4aUserUuidHeaderKey    = "X-DT4A-User-Uuid"
 )
 
 var (
@@ -33,7 +40,12 @@ var (
 		"chrome-extension://hiajhnnfoihkhlmfejoljaokdpgboiea":  {},
 		"chrome-extension://kioanpobaefjdloichnjebbdafiloboa":  {},
 		"chrome-extension://bkpbhnjcbehoklfkljkkbbmipaphipgl":  {},
+		// Development web app
+		"https://my.b5local.com:4000":           {},
+		"https://dev.sites.gitlab.1password.io": {},
 	}
+
+	allowlisted1POriginRegex = regexp.MustCompile(`https:\/\/.+\.1password\.(com|ca|eu)`)
 )
 
 const (
@@ -51,22 +63,49 @@ type dt4aResponse struct {
 	PubKey string `json:"pubKey"`
 }
 
+// originIsAllowlisted checks the given request origin against our allowable values.
+// We allow present-but-empty origins.
+func originIsAllowlisted(requestOrigin string) bool {
+	// Allow present-but-empty origins
+	if requestOrigin == "" {
+		return true
+	}
+
+	// Allow origins in the allowlist
+	if _, ok := allowlistedDt4aOriginsLookup[requestOrigin]; ok {
+		return true
+	}
+
+	// Allow origin from safari web extension
+	if strings.HasPrefix(requestOrigin, safariWebExtensionScheme) {
+		return true
+	}
+
+	// Check against known/allowlisted origin patterns
+	if allowlisted1POriginRegex.MatchString(requestOrigin) {
+		return true
+	}
+
+	return false
+}
+
 func (d *dt4aAuthMiddleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r, span := observability.StartHttpRequestSpan(r)
+		defer span.End()
+
 		// Validate origin. We expect to either have the origin set to an allowlisted value, or to be
 		// present but empty, or to be missing. We will not allow a request with a nonempty origin
 		// that is not in the allowlist.
 		requestOrigin := r.Header.Get("Origin")
-		if requestOrigin != "" {
-			if _, ok := allowlistedDt4aOriginsLookup[requestOrigin]; !ok && !strings.HasPrefix(requestOrigin, safariWebExtensionScheme) {
-				escapedOrigin := strings.ReplaceAll(strings.ReplaceAll(requestOrigin, "\n", ""), "\r", "") // remove any newlines
-				d.slogger.Log(r.Context(), slog.LevelInfo,
-					"received dt4a request with origin not in allowlist",
-					"req_origin", escapedOrigin,
-				)
-				w.WriteHeader(http.StatusForbidden)
-				return
-			}
+		if !originIsAllowlisted(requestOrigin) {
+			escapedOrigin := strings.ReplaceAll(strings.ReplaceAll(requestOrigin, "\n", ""), "\r", "") // remove any newlines
+			d.slogger.Log(r.Context(), slog.LevelInfo,
+				"received dt4a request with origin not in allowlist",
+				"req_origin", escapedOrigin,
+			)
+			w.WriteHeader(http.StatusForbidden)
+			return
 		}
 
 		boxParam := r.URL.Query().Get("payload")
@@ -114,6 +153,9 @@ func (d *dt4aAuthMiddleware) Wrap(next http.Handler) http.Handler {
 		bhrHeaders := make(http.Header)
 		maps.Copy(bhrHeaders, r.Header)
 
+		bhrHeaders.Add(dt4aAccountUuidHeaderKey, requestTrustChain.accountUuid)
+		bhrHeaders.Add(dt4aUserUuidHeaderKey, requestTrustChain.userUuid)
+
 		newReq := &http.Request{
 			Method: r.Method,
 			Header: bhrHeaders,
@@ -128,6 +170,14 @@ func (d *dt4aAuthMiddleware) Wrap(next http.Handler) http.Handler {
 		bhr := &bufferedHttpResponse{}
 		next.ServeHTTP(bhr, newReq)
 
+		if bhr.code < 200 || bhr.code >= 300 {
+			// hacky sleep here so that it's likely a response form another launcher
+			// on a different port will return with success faster than this failure
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// even if the downstream hander did not write a body, we still create a nacl box & dt4a response
+		// this allows a caller to know it's at least talking to valid agent
 		box, pubKey, err := echelper.SealNaCl(bhr.Bytes(), requestTrustChain.counterPartyPubEncryptionKey)
 		if err != nil {
 			d.slogger.Log(r.Context(), slog.LevelError,
@@ -155,6 +205,11 @@ func (d *dt4aAuthMiddleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
+		// if a downstream handler has set a code, set it here
+		if bhr.code != 0 {
+			w.WriteHeader(bhr.code)
+		}
+
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(dt4aResponseJson)
 	})
@@ -180,6 +235,9 @@ type chain struct {
 	// counterPartyPubEncryptionKey is the last public key in the chain, which is a x25519 key
 	// we set this after we extract and verify in the validate method
 	counterPartyPubEncryptionKey *[32]byte
+
+	// userdata set using verified data from last link in chain
+	accountUuid, userUuid string
 }
 
 // chainLink represents a link in a chain of trust
@@ -265,6 +323,12 @@ func (c *chain) validate(trustedKeys map[string]*ecdsa.PublicKey) error {
 			return fmt.Errorf("payload at index %d has expired, kid %s", i, currentPayload.PublicKey.KeyID)
 		}
 
+		// always set to last verified link in chain, no particular reason to use last link
+		// all links should have same value
+		c.accountUuid = currentPayload.AccountUuid
+		c.userUuid = currentPayload.UserUuid
+
+		// last link is a x25519 key no used for signature validation, no need to convert / set as parent
 		if i < len(c.Links)-1 {
 			ecdsaPubKey, err := currentPayload.PublicKey.ecdsaPubKey()
 			if err != nil {

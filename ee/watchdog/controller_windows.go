@@ -5,7 +5,6 @@ package watchdog
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,11 +13,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/NozomiNetworks/go-comshim"
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
 	"github.com/kolide/launcher/ee/agent/flags/keys"
 	agentsqlite "github.com/kolide/launcher/ee/agent/storage/sqlite"
 	"github.com/kolide/launcher/ee/agent/types"
+	"github.com/kolide/launcher/ee/log"
 	"github.com/kolide/launcher/ee/observability"
 	"github.com/kolide/launcher/ee/powereventwatcher"
 	"github.com/kolide/launcher/pkg/launcher"
@@ -100,56 +101,19 @@ func (wc *WatchdogController) publishLogs(ctx context.Context) {
 
 	// don't bother processing further unless watchdog is enabled.
 	// note that this means if you manually install watchdog via CLI, logs
-	// will not be published unless you have the corresponding feature flag enabled
-	if !wc.knapsack.LauncherWatchdogEnabled() {
-		return
-	}
-
+	// will not be published unless you have the corresponding feature flag enabled.
 	// note that there is a small window here where there could be pending logs before the watchdog task is removed -
 	// there is no harm in leaving them and we could recover these with the original timestamps if we ever needed.
 	// to avoid endlessly re-processing empty logs while we are disabled, we accept this possibility and exit early here
-	watchdogTaskIsInstalled, err := watchdogTaskExists(wc.knapsack.Identifier())
-	if err != nil {
-		wc.slogger.Log(ctx, slog.LevelWarn,
-			"encountered error checking if watchdog task exists",
-			"err", err,
-		)
-
-		return
-	}
-
-	// no need to parse logs if task is not installed
-	if !watchdogTaskIsInstalled {
+	if !wc.knapsack.LauncherWatchdogEnabled() {
 		return
 	}
 
 	logsToDelete := make([]any, 0)
 
 	if err := wc.logPublisher.ForEach(func(rowid, timestamp int64, v []byte) error {
-		logRecord := make(map[string]any)
 		logsToDelete = append(logsToDelete, rowid)
-
-		if err := json.Unmarshal(v, &logRecord); err != nil {
-			wc.slogger.Log(ctx, slog.LevelError,
-				"failed to unmarshal sqlite log",
-				"log", string(v),
-				"err", err,
-			)
-
-			// log the issue but don't return an error, we want to keep processing whatever we can
-			return nil
-		}
-
-		logArgs := make([]slog.Attr, len(logRecord))
-		for k, v := range logRecord {
-			logArgs = append(logArgs, slog.Any(k, v))
-		}
-
-		// re-issue the log, this time with the debug.json writer
-		// pulling out the existing log and re-adding all attributes like this will overwrite
-		// the automatic timestamp creation, as well as the msg and level set below
-		wc.slogger.LogAttrs(ctx, slog.LevelInfo, "", logArgs...)
-
+		log.LogRawLogRecord(ctx, v, wc.slogger)
 		return nil
 	}); err != nil {
 		wc.slogger.Log(ctx, slog.LevelError, "iterating sqlite logs", "err", err)
@@ -169,12 +133,11 @@ func (wc *WatchdogController) publishLogs(ctx context.Context) {
 
 func (wc *WatchdogController) Interrupt(_ error) {
 	// Only perform shutdown tasks on first call to interrupt -- no need to repeat on potential extra calls.
-	if wc.interrupted.Load() {
+	if wc.interrupted.Swap(true) {
 		return
 	}
 
 	wc.logPublisher.Close()
-	wc.interrupted.Store(true)
 	wc.interrupt <- struct{}{}
 }
 
@@ -241,10 +204,11 @@ func installWatchdogTask(identifier, configFilePath string) error {
 	}
 
 	taskName := launcher.TaskName(identifier, watchdogTaskType)
-	// init COM - we discard the error returned by CoInitialize because it
-	// harmlessly returns S_FALSE if we call it more than once
-	ole.CoInitialize(0)
-	defer ole.CoUninitialize()
+	if err := comshim.TryAdd(1); err != nil {
+		comshim.Done() // ensure we decrement the global shim counter that TryAdd increments immediately
+		return fmt.Errorf("unable to init comshim: %w", err)
+	}
+	defer comshim.Done()
 
 	// create our scheduler object
 	schedService, err := oleutil.CreateObject("Schedule.Service")
@@ -571,10 +535,11 @@ func RemoveWatchdogTask(identifier string) error {
 	}
 
 	taskName := launcher.TaskName(identifier, watchdogTaskType)
-	// init COM - we discard the error returned by CoInitialize because it
-	// harmlessly returns S_FALSE if we call it more than once
-	ole.CoInitialize(0)
-	defer ole.CoUninitialize()
+	if err := comshim.TryAdd(1); err != nil {
+		comshim.Done() // ensure we decrement the global shim counter that TryAdd increments immediately
+		return fmt.Errorf("unable to init comshim: %w", err)
+	}
+	defer comshim.Done()
 
 	// create our scheduler object
 	schedService, err := oleutil.CreateObject("Schedule.Service")
@@ -616,16 +581,17 @@ func RemoveWatchdogTask(identifier string) error {
 
 // watchdogTaskExists connects with the scheduler service to determine whether
 // a watchdog task for the given identifier is installed on the device
-func watchdogTaskExists(identifier string) (bool, error) {
+func watchdogTaskExists(identifier string) (bool, error) { // nolint:unused
 	if strings.TrimSpace(identifier) == "" {
 		identifier = launcher.DefaultLauncherIdentifier
 	}
 
 	taskName := launcher.TaskName(identifier, watchdogTaskType)
-	// init COM - we discard the error returned by CoInitialize because it
-	// harmlessly returns S_FALSE if we call it more than once
-	ole.CoInitialize(0)
-	defer ole.CoUninitialize()
+	if err := comshim.TryAdd(1); err != nil {
+		comshim.Done() // ensure we decrement the global shim counter that TryAdd increments immediately
+		return false, fmt.Errorf("unable to init comshim: %w", err)
+	}
+	defer comshim.Done()
 
 	// create our scheduler object
 	schedService, err := oleutil.CreateObject("Schedule.Service")

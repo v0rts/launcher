@@ -15,15 +15,16 @@ const (
 type localLogger struct {
 	logger log.Logger
 	writer io.Writer
+	lj     *lumberjack.Logger
 }
 
 func NewKitLogger(logFilePath string) localLogger {
 	// This is meant as an always available debug tool. Thus we hardcode these options
 	lj := &lumberjack.Logger{
 		Filename:   logFilePath,
-		MaxSize:    3, // megabytes
+		MaxSize:    5, // megabytes
 		Compress:   true,
-		MaxBackups: 5,
+		MaxBackups: 8,
 	}
 
 	writer := log.NewSyncWriter(lj)
@@ -34,10 +35,15 @@ func NewKitLogger(logFilePath string) localLogger {
 			"ts", log.DefaultTimestampUTC,
 			"caller", log.DefaultCaller, ///log.Caller(6),
 		),
+		lj:     lj, // keep a reference to lumberjack Logger so it can be closed if needed
 		writer: writer,
 	}
 
 	return ll
+}
+
+func (ll localLogger) Close() error {
+	return ll.lj.Close()
 }
 
 func (ll localLogger) Log(keyvals ...interface{}) error {

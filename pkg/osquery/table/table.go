@@ -16,10 +16,12 @@ import (
 	"github.com/kolide/launcher/ee/tables/dataflattentable"
 	"github.com/kolide/launcher/ee/tables/desktopprocs"
 	"github.com/kolide/launcher/ee/tables/dev_table_tooling"
+	json_parser "github.com/kolide/launcher/ee/tables/execparsers/json"
 	"github.com/kolide/launcher/ee/tables/firefox_preferences"
 	"github.com/kolide/launcher/ee/tables/jwt"
 	"github.com/kolide/launcher/ee/tables/launcher_db"
 	"github.com/kolide/launcher/ee/tables/osquery_instance_history"
+	"github.com/kolide/launcher/ee/tables/sleeper"
 	"github.com/kolide/launcher/ee/tables/tdebug"
 	"github.com/kolide/launcher/ee/tables/tufinfo"
 
@@ -38,7 +40,6 @@ func LauncherTables(k types.Knapsack, slogger *slog.Logger) []osquery.OsqueryPlu
 		LauncherAutoupdateConfigTable(slogger, k),
 		osquery_instance_history.TablePlugin(k, slogger),
 		tufinfo.TufReleaseVersionTable(slogger, k),
-		launcher_db.TablePlugin(k, slogger, "kolide_tuf_autoupdater_errors", k.AutoupdateErrorsStore()),
 		desktopprocs.TablePlugin(k, slogger),
 	}
 }
@@ -56,13 +57,11 @@ func PlatformTables(k types.Knapsack, registrationId string, slogger *slog.Logge
 		cryptoinfotable.TablePlugin(k, slogger),
 		dev_table_tooling.TablePlugin(k, slogger),
 		firefox_preferences.TablePlugin(k, slogger),
+		sleeper.TablePlugin(k, slogger),
 		jwt.TablePlugin(k, slogger),
-		dataflattentable.TablePluginExec(k, slogger,
-			"kolide_zerotier_info", dataflattentable.JsonType, allowedcmd.ZerotierCli, []string{"info"}),
-		dataflattentable.TablePluginExec(k, slogger,
-			"kolide_zerotier_networks", dataflattentable.JsonType, allowedcmd.ZerotierCli, []string{"listnetworks"}),
-		dataflattentable.TablePluginExec(k, slogger,
-			"kolide_zerotier_peers", dataflattentable.JsonType, allowedcmd.ZerotierCli, []string{"listpeers"}),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_zerotier_info", json_parser.Parser, allowedcmd.ZerotierCli, []string{"info", "-j"}),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_zerotier_networks", json_parser.Parser, allowedcmd.ZerotierCli, []string{"listnetworks", "-j"}),
+		dataflattentable.NewExecAndParseTable(k, slogger, "kolide_zerotier_peers", json_parser.Parser, allowedcmd.ZerotierCli, []string{"listpeers", "-j"}),
 		tdebug.LauncherGcInfo(k, slogger),
 	}
 

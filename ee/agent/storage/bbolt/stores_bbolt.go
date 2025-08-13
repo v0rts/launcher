@@ -21,7 +21,6 @@ func MakeStores(ctx context.Context, slogger *slog.Logger, db *bbolt.DB) (map[st
 	var storeNames = []storage.Store{
 		storage.AgentFlagsStore,
 		storage.KatcConfigStore,
-		storage.AutoupdateErrorsStore,
 		storage.ConfigStore,
 		storage.ControlStore,
 		storage.PersistentHostDataStore,
@@ -35,6 +34,8 @@ func MakeStores(ctx context.Context, slogger *slog.Logger, db *bbolt.DB) (map[st
 		storage.ControlServerActionsStore,
 		storage.LauncherHistoryStore,
 		storage.Dt4aInfoStore,
+		storage.WindowsUpdatesCacheStore,
+		storage.RegistrationStore,
 	}
 
 	for _, storeName := range storeNames {

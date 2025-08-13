@@ -148,7 +148,11 @@ func runDesktop(_ *multislogger.MultiSlogger, args []string) error {
 
 	server, err := userserver.New(slogger, *flUserServerAuthToken, *flUserServerSocketPath, shutdownChan, showDesktopChan, notifier)
 	if err != nil {
-		return err
+		slogger.Log(context.TODO(), slog.LevelError,
+			"could not create user server",
+			"err", err,
+		)
+		return fmt.Errorf("creating server: %w", err)
 	}
 
 	universalLinkHandler, urlInput := universallink.NewUniversalLinkHandler(slogger)
@@ -281,7 +285,7 @@ func monitorParentProcess(slogger *slog.Logger, runnerServerUrl, runnerServerAut
 	for ; true; <-ticker.C {
 		// check to to ensure that the ppid is still legit
 		if os.Getppid() < 2 {
-			slogger.Log(context.TODO(), slog.LevelDebug,
+			slogger.Log(context.TODO(), slog.LevelError,
 				"ppid is 0 or 1, exiting",
 			)
 			break
@@ -309,7 +313,7 @@ func monitorParentProcess(slogger *slog.Logger, runnerServerUrl, runnerServerAut
 
 		// retry
 		if errCount < maxErrCount {
-			slogger.Log(context.TODO(), slog.LevelDebug,
+			slogger.Log(context.TODO(), slog.LevelWarn,
 				"could not connect to parent, will retry",
 				"err", err,
 				"attempts", errCount,
@@ -320,7 +324,7 @@ func monitorParentProcess(slogger *slog.Logger, runnerServerUrl, runnerServerAut
 		}
 
 		// errCount >= maxErrCount, exit
-		slogger.Log(context.TODO(), slog.LevelDebug,
+		slogger.Log(context.TODO(), slog.LevelError,
 			"could not connect to parent, max attempts reached, exiting",
 			"err", err,
 			"attempts", errCount,

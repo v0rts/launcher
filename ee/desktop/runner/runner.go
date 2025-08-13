@@ -33,6 +33,7 @@ import (
 	"github.com/kolide/launcher/ee/desktop/user/menu"
 	"github.com/kolide/launcher/ee/desktop/user/notify"
 	"github.com/kolide/launcher/ee/gowrapper"
+	"github.com/kolide/launcher/ee/log"
 	"github.com/kolide/launcher/ee/observability"
 	"github.com/kolide/launcher/ee/presencedetection"
 	"github.com/kolide/launcher/ee/ui/assets"
@@ -224,8 +225,8 @@ func (r *DesktopUsersProcessesRunner) Execute() error {
 	for {
 		// Check immediately on each iteration, avoiding the initial ticker delay
 		if err := r.runConsoleUserDesktop(); err != nil {
-			r.slogger.Log(context.TODO(), slog.LevelInfo,
-				"running console user desktop",
+			r.slogger.Log(context.TODO(), slog.LevelError,
+				"could not run console user desktop process",
 				"err", err,
 			)
 		}
@@ -252,11 +253,9 @@ func (r *DesktopUsersProcessesRunner) Execute() error {
 // It also signals the execute loop to exit, so new desktop processes cease to spawn.
 func (r *DesktopUsersProcessesRunner) Interrupt(_ error) {
 	// Only perform shutdown tasks on first call to interrupt -- no need to repeat on potential extra calls.
-	if r.interrupted.Load() {
+	if r.interrupted.Swap(true) {
 		return
 	}
-
-	r.interrupted.Store(true)
 
 	// Tell the execute loop to stop checking, and exit
 	r.interrupt <- struct{}{}
@@ -394,7 +393,7 @@ func (r *DesktopUsersProcessesRunner) killDesktopProcesses(ctx context.Context) 
 		maps.Clear(r.uidProcs)
 		return
 	case <-time.After(r.interruptTimeout):
-		r.slogger.Log(ctx, slog.LevelError,
+		r.slogger.Log(ctx, slog.LevelInfo,
 			"timeout waiting for desktop processes to exit, now killing",
 		)
 
@@ -520,7 +519,7 @@ func (r *DesktopUsersProcessesRunner) Update(data io.Reader) error {
 		return fmt.Errorf("error reading control data: %w", err)
 	}
 	if err := r.writeSharedFile(r.menuTemplatePath(), dataBytes); err != nil {
-		r.slogger.Log(context.TODO(), slog.LevelError,
+		r.slogger.Log(context.TODO(), slog.LevelWarn,
 			"menu template file did not exist, could not create it",
 			"err", err,
 		)
@@ -559,7 +558,7 @@ func (r *DesktopUsersProcessesRunner) FlagsChanged(ctx context.Context, flagKeys
 		client := client.New(r.userServerAuthToken, proc.socketPath)
 		if err := client.ShowDesktop(); err != nil {
 			r.slogger.Log(ctx, slog.LevelError,
-				"sending refresh command to user desktop process",
+				"sending refresh command to user desktop process after DesktopEnabled flag change",
 				"uid", uid,
 				"pid", proc.Process.Pid,
 				"path", proc.socketPath,
@@ -687,7 +686,7 @@ func (r *DesktopUsersProcessesRunner) writeDefaultMenuTemplateFile() {
 
 	if os.IsNotExist(err) {
 		if err := r.writeSharedFile(menuTemplatePath, menu.InitialMenu); err != nil {
-			r.slogger.Log(context.TODO(), slog.LevelError,
+			r.slogger.Log(context.TODO(), slog.LevelWarn,
 				"menu template file did not exist, could not create it",
 				"err", err,
 			)
@@ -780,23 +779,20 @@ func (r *DesktopUsersProcessesRunner) spawnForUser(ctx context.Context, uid stri
 		pingFunc = client.ShowDesktop
 	}
 
+	// If the process isn't responsive after 10 seconds, kill it and return an error
 	if err := backoff.WaitFor(pingFunc, 10*time.Second, 1*time.Second); err != nil {
+		observability.SetError(span, fmt.Errorf("pinging user desktop server after startup: pid %d: %w", cmd.Process.Pid, err))
+
 		// unregister proc from desktop server so server will not respond to its requests
 		r.runnerServer.DeRegisterClient(uid)
 
-		if err := cmd.Process.Kill(); err != nil {
-			r.slogger.Log(ctx, slog.LevelError,
-				"killing user desktop process after startup ping / show desktop failed",
-				"uid", uid,
-				"pid", cmd.Process.Pid,
-				"path", cmd.Path,
-				"err", err,
-			)
+		// Try to kill the process. It may already be gone, in which case Process.Kill() will return an error --
+		// we can ignore those.
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) && err.Error() != "invalid argument" {
+			return fmt.Errorf("killing user desktop process after startup failed: %w", err)
 		}
 
-		observability.SetError(span, fmt.Errorf("pinging user desktop server after startup: pid %d: %w", cmd.Process.Pid, err))
-
-		return fmt.Errorf("pinging user desktop server after startup: pid %d: %w", cmd.Process.Pid, err)
+		return fmt.Errorf("user desktop server not responsive to ping after startup: pid %d: %w", cmd.Process.Pid, err)
 	}
 
 	r.slogger.Log(ctx, slog.LevelDebug,
@@ -851,7 +847,7 @@ func (r *DesktopUsersProcessesRunner) waitOnProcessAsync(uid string, proc *os.Pr
 		// waiting here gives the parent a chance to clean up
 		state, err := proc.Wait()
 		if err != nil {
-			r.slogger.Log(context.TODO(), slog.LevelInfo,
+			r.slogger.Log(context.TODO(), slog.LevelError,
 				"desktop process died",
 				"uid", uid,
 				"pid", proc.Pid,
@@ -1037,15 +1033,13 @@ func (r *DesktopUsersProcessesRunner) processLogs(uid string, stdErr io.ReadClos
 	combined := io.MultiReader(stdErr, stdOut)
 	scanner := bufio.NewScanner(combined)
 
+	slogger := r.slogger.With("uid", uid, "subprocess", "desktop")
+
 	for scanner.Scan() {
 		logLine := scanner.Text()
 
 		// First, log the incoming log.
-		r.slogger.Log(context.TODO(), slog.LevelDebug, // nolint:sloglint // it's fine to not have a constant or literal here
-			logLine,
-			"uid", uid,
-			"subprocess", "desktop",
-		)
+		log.LogRawLogRecord(context.TODO(), []byte(logLine), slogger)
 
 		// Now, check log to see if we need to restart systray.
 		// Only perform the restart if the feature flag is enabled.
@@ -1065,15 +1059,35 @@ func (r *DesktopUsersProcessesRunner) processLogs(uid string, stdErr io.ReadClos
 			continue
 		}
 
-		// Kill the desktop process for the given uid to force it to restart systray.
+		// We know that systray needs to restart, which means we need to kill this desktop
+		// process in order to restart it fully. However, this process is still starting up --
+		// we may not have a record for it yet in r.uidProcs. We want to delay slightly before
+		// attempting to kill the process. We usually see the process show up in under a second
+		// after we detect that systray needs a restart, so delaying five seconds should be sufficient.
+		time.Sleep(5 * time.Second)
+
 		r.slogger.Log(context.TODO(), slog.LevelInfo,
 			"noticed systray error -- shutting down and restarting desktop processes",
 			"systray_log", logLine,
 			"uid", uid,
 		)
-		if err := r.killDesktopProcess(context.Background(), uid); err != nil {
-			r.slogger.Log(context.TODO(), slog.LevelInfo,
-				"could not kill desktop process",
+
+		// We want to perform some retries if we can't kill the process -- we aren't likely to get
+		// another log indicating that systray needs to restart, so we really want to fix this now.
+		// The call to `Shutdown` has a 30-second timeout, so we have a 35-second retry interval.
+		if err := backoff.WaitFor(func() error {
+			if err := r.killDesktopProcess(context.Background(), uid); err != nil {
+				r.slogger.Log(context.TODO(), slog.LevelWarn,
+					"could not kill desktop process, will retry",
+					"err", err,
+					"uid", uid,
+				)
+			}
+
+			return nil
+		}, 3*time.Minute, 35*time.Second); err != nil {
+			r.slogger.Log(context.TODO(), slog.LevelError,
+				"could not kill desktop process after detecting systray initialization error",
 				"err", err,
 				"uid", uid,
 			)

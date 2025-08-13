@@ -3,6 +3,7 @@ package exporter
 import (
 	"context"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,8 +17,10 @@ import (
 	osquerygotraces "github.com/osquery/osquery-go/traces"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
@@ -38,6 +41,7 @@ var enrollmentDetailsRecheckInterval = 5 * time.Second
 
 type TelemetryExporter struct {
 	tracerProvider            *sdktrace.TracerProvider
+	meterProvider             *sdkmetric.MeterProvider
 	providerLock              sync.Mutex
 	bufSpanProcessor          *bufspanprocessor.BufSpanProcessor
 	knapsack                  types.Knapsack
@@ -86,9 +90,8 @@ func NewTelemetryExporter(ctx context.Context, k types.Knapsack, initialTraceBuf
 		t.bufSpanProcessor = initialTraceBuffer.bufSpanProcessor
 		t.attrs = initialTraceBuffer.attrs
 	} else {
-		t.bufSpanProcessor = &bufspanprocessor.BufSpanProcessor{
-			MaxBufferedSpans: 500,
-		}
+		t.bufSpanProcessor = bufspanprocessor.NewBufSpanProcessor(500)
+		t.bufSpanProcessor.SetSlogger(k.Slogger())
 		t.attrs = initialAttrs()
 	}
 
@@ -129,7 +132,7 @@ func (t *TelemetryExporter) addDeviceIdentifyingAttributes() {
 
 	if deviceId, err := t.knapsack.ServerProvidedDataStore().Get([]byte("device_id")); err != nil {
 		t.slogger.Log(context.TODO(), slog.LevelWarn,
-			"could not get device id",
+			"could not get device id for attributes",
 			"err", err,
 		)
 	} else {
@@ -139,7 +142,7 @@ func (t *TelemetryExporter) addDeviceIdentifyingAttributes() {
 
 	if munemo, err := t.knapsack.ServerProvidedDataStore().Get([]byte("munemo")); err != nil {
 		t.slogger.Log(context.TODO(), slog.LevelWarn,
-			"could not get munemo",
+			"could not get munemo for attributes",
 			"err", err,
 		)
 	} else {
@@ -148,7 +151,7 @@ func (t *TelemetryExporter) addDeviceIdentifyingAttributes() {
 
 	if orgId, err := t.knapsack.ServerProvidedDataStore().Get([]byte("organization_id")); err != nil {
 		t.slogger.Log(context.TODO(), slog.LevelWarn,
-			"could not get organization id",
+			"could not get organization id for attributes",
 			"err", err,
 		)
 	} else {
@@ -157,11 +160,25 @@ func (t *TelemetryExporter) addDeviceIdentifyingAttributes() {
 
 	if serialNumber, err := t.knapsack.ServerProvidedDataStore().Get([]byte("serial_number")); err != nil {
 		t.slogger.Log(context.TODO(), slog.LevelWarn,
-			"could not get serial number",
+			"could not get serial number for attributes",
 			"err", err,
 		)
 	} else {
 		t.attrs = append(t.attrs, attribute.String("launcher.serial", string(serialNumber)))
+	}
+
+	t.attrs = append(t.attrs, attribute.String("launcher.update_channel", t.knapsack.UpdateChannel()))
+
+	// Add some attributes about the currently-running process, too
+	t.attrs = append(t.attrs, attribute.String("launcher.run_id", t.knapsack.GetRunID()))
+	t.attrs = append(t.attrs, semconv.ProcessPID(os.Getpid()))
+	if execPath, err := os.Executable(); err != nil {
+		t.slogger.Log(context.TODO(), slog.LevelWarn,
+			"could not get executable path for attributes",
+			"err", err,
+		)
+	} else {
+		t.attrs = append(t.attrs, semconv.ProcessExecutablePath(execPath))
 	}
 }
 
@@ -223,12 +240,9 @@ func (t *TelemetryExporter) addAttributesFromEnrollmentDetails(details types.Enr
 	)
 }
 
-// setNewGlobalProvider creates and sets a new global provider with the currently-available
-// attributes. If a provider was previously set, it will be shut down.
+// setNewGlobalProvider creates and sets new global providers with the currently-available
+// attributes. If providers were previously set, they will be shut down.
 func (t *TelemetryExporter) setNewGlobalProvider(rebuildExporter bool) {
-	t.providerLock.Lock()
-	defer t.providerLock.Unlock()
-
 	t.attrLock.RLock()
 	defer t.attrLock.RUnlock()
 
@@ -245,6 +259,20 @@ func (t *TelemetryExporter) setNewGlobalProvider(rebuildExporter bool) {
 		r = resource.Default()
 	}
 
+	t.setNewGlobalTracerProvider(r, rebuildExporter)
+	t.setNewGlobalMeterProvider(r)
+
+	// set ingest url after successfully setting up new child processor
+	t.ingestUrl = t.knapsack.TraceIngestServerURL()
+}
+
+// setNewGlobalTracerProvider updates the global tracer provider:
+// * It sets the latest launcher attributes on the resource, so that those details will be exported with the traces
+// * If `rebuildExporter` is true, it re-creates the trace exporter with the latest ingest server URL and authentication
+func (t *TelemetryExporter) setNewGlobalTracerProvider(launcherResource *resource.Resource, rebuildExporter bool) {
+	t.providerLock.Lock()
+	defer t.providerLock.Unlock()
+
 	// Sample root spans based on t.traceSamplingRate, then sample child spans based on the
 	// decision made for their parent: if parent is sampled, then children should be as well;
 	// otherwise, do not sample child spans.
@@ -252,7 +280,7 @@ func (t *TelemetryExporter) setNewGlobalProvider(rebuildExporter bool) {
 
 	newProvider := sdktrace.NewTracerProvider(
 		sdktrace.WithSpanProcessor(t.bufSpanProcessor),
-		sdktrace.WithResource(r),
+		sdktrace.WithResource(launcherResource),
 		sdktrace.WithSampler(parentBasedSampler),
 	)
 
@@ -263,7 +291,12 @@ func (t *TelemetryExporter) setNewGlobalProvider(rebuildExporter bool) {
 		// shutdown still gets called even though the span processor is unregistered
 		// leaving this in because it just feel correct
 		t.tracerProvider.UnregisterSpanProcessor(t.bufSpanProcessor)
-		t.tracerProvider.Shutdown(t.ctx)
+		if err := t.tracerProvider.Shutdown(t.ctx); err != nil {
+			t.slogger.Log(t.ctx, slog.LevelWarn,
+				"could not shut down old tracer provider to replace it",
+				"err", err,
+			)
+		}
 	}
 
 	t.tracerProvider = newProvider
@@ -296,12 +329,55 @@ func (t *TelemetryExporter) setNewGlobalProvider(rebuildExporter bool) {
 	// create child processor with new exporter and set it on the bufspanprocessor
 	batchSpanProcessor := sdktrace.NewBatchSpanProcessor(exporter, sdktrace.WithBatchTimeout(t.batchTimeout))
 	t.bufSpanProcessor.SetChildProcessor(batchSpanProcessor)
-
-	// set ingest url after successfully setting up new child processor
-	t.ingestUrl = t.knapsack.TraceIngestServerURL()
 }
 
-// Execute begins exporting observability. if exporting is enabled.
+// setNewGlobalMeterProvider updates the global meter provider:
+// * It creates a metrics exporter to ship the metrics with the latest ingest server URL and authentication
+// * It sets the latest launcher attributes on the resource, so that those details will be exported with the metrics
+// (Unlike with setNewGlobalTracerProvider, we always have to create a new exporter here.)
+func (t *TelemetryExporter) setNewGlobalMeterProvider(launcherResource *resource.Resource) {
+	t.providerLock.Lock()
+	defer t.providerLock.Unlock()
+
+	traceClientOpts := []otlpmetricgrpc.Option{
+		otlpmetricgrpc.WithEndpoint(t.knapsack.TraceIngestServerURL()),
+		otlpmetricgrpc.WithDialOption(grpc.WithPerRPCCredentials(t.ingestClientAuthenticator)),
+	}
+	if t.disableIngestTLS {
+		traceClientOpts = append(traceClientOpts, otlpmetricgrpc.WithInsecure())
+	}
+
+	metricsExporter, err := otlpmetricgrpc.New(context.TODO(), traceClientOpts...)
+	if err != nil {
+		t.slogger.Log(context.TODO(), slog.LevelWarn,
+			"could not create metrics gRPC exporter",
+			"err", err,
+		)
+		return
+	}
+
+	// Create new meter provider and let otel set it globally
+	newMeterProvider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(launcherResource),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricsExporter, sdkmetric.WithInterval(15*time.Minute))),
+	)
+	otel.SetMeterProvider(newMeterProvider)
+
+	// Shut down and replace old meter provider with new one
+	if t.meterProvider != nil {
+		if err := t.meterProvider.Shutdown(context.TODO()); err != nil {
+			t.slogger.Log(context.TODO(), slog.LevelWarn,
+				"could not shut down old meter provider to replace it",
+				"err", err,
+			)
+		}
+	}
+	t.meterProvider = newMeterProvider
+
+	observability.ReinitializeMetrics()
+}
+
+// Execute begins exporting telemetry if exporting is enabled.
 func (t *TelemetryExporter) Execute() error {
 	if t.enabled {
 		t.setNewGlobalProvider(true)
@@ -316,14 +392,36 @@ func (t *TelemetryExporter) Execute() error {
 
 func (t *TelemetryExporter) Interrupt(_ error) {
 	// Only perform shutdown tasks on first call to interrupt -- no need to repeat on potential extra calls.
-	if t.interrupted.Load() {
+	if t.interrupted.Swap(true) {
 		return
 	}
 
-	t.interrupted.Store(true)
+	// We must use context.Background here, not t.ctx -- if we use t.ctx, the restart metric won't ship,
+	// and calls to Shutdown will time out.
+	interruptCtx, interruptCancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer interruptCancel()
+
+	// Record launcher shutdown -- we do this here (rather than in e.g. rungroup shutdown) to ensure
+	// we will write this metric before we complete `Interrupt`
+	observability.LauncherRestartCounter.Add(interruptCtx, 1)
+	time.Sleep(1 * time.Second)
 
 	if t.tracerProvider != nil {
-		t.tracerProvider.Shutdown(t.ctx)
+		if err := t.tracerProvider.Shutdown(interruptCtx); err != nil {
+			t.slogger.Log(interruptCtx, slog.LevelWarn,
+				"could not shut down tracer provider on interrupt",
+				"err", err,
+			)
+		}
+	}
+
+	if t.meterProvider != nil {
+		if err := t.meterProvider.Shutdown(interruptCtx); err != nil {
+			t.slogger.Log(interruptCtx, slog.LevelWarn,
+				"could not shut down meter provider on interrupt",
+				"err", err,
+			)
+		}
 	}
 
 	t.cancel()
@@ -370,11 +468,24 @@ func (t *TelemetryExporter) FlagsChanged(ctx context.Context, flagKeys ...keys.F
 		} else if t.enabled && !t.knapsack.ExportTraces() {
 			// Newly disabled
 			if t.tracerProvider != nil {
-				t.tracerProvider.Shutdown(t.ctx)
+				if err := t.tracerProvider.Shutdown(context.TODO()); err != nil {
+					t.slogger.Log(ctx, slog.LevelWarn,
+						"could not shut down tracer provider on trace disable",
+						"err", err,
+					)
+				}
+			}
+			if t.meterProvider != nil {
+				if err := t.meterProvider.Shutdown(context.TODO()); err != nil {
+					t.slogger.Log(ctx, slog.LevelWarn,
+						"could not shut down meter provider on trace disable",
+						"err", err,
+					)
+				}
 			}
 			t.enabled = false
 			t.slogger.Log(ctx, slog.LevelDebug,
-				"disabling trace export",
+				"disabling telemetry export",
 			)
 		}
 	}

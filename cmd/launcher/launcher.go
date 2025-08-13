@@ -39,6 +39,7 @@ import (
 	"github.com/kolide/launcher/ee/control/consumers/notificationconsumer"
 	"github.com/kolide/launcher/ee/control/consumers/remoterestartconsumer"
 	"github.com/kolide/launcher/ee/control/consumers/uninstallconsumer"
+	performancedebug "github.com/kolide/launcher/ee/debug"
 	"github.com/kolide/launcher/ee/debug/checkups"
 	desktopRunner "github.com/kolide/launcher/ee/desktop/runner"
 	"github.com/kolide/launcher/ee/gowrapper"
@@ -46,6 +47,7 @@ import (
 	"github.com/kolide/launcher/ee/observability"
 	"github.com/kolide/launcher/ee/observability/exporter"
 	"github.com/kolide/launcher/ee/powereventwatcher"
+	"github.com/kolide/launcher/ee/tables/windowsupdatetable"
 	"github.com/kolide/launcher/ee/tuf"
 	"github.com/kolide/launcher/ee/watchdog"
 	"github.com/kolide/launcher/pkg/augeas"
@@ -212,9 +214,6 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 	initLauncherHistory(k)
 
 	gowrapper.Go(ctx, slogger, func() {
-		osquery.CollectAndSetEnrollmentDetails(ctx, slogger, k, 60*time.Second, 6*time.Second)
-	})
-	gowrapper.Go(ctx, slogger, func() {
 		runOsqueryVersionCheckAndAddToKnapsack(ctx, slogger, k, k.LatestOsquerydPath(ctx))
 	})
 	gowrapper.Go(ctx, slogger, func() {
@@ -262,7 +261,7 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 
 		telemetryExporter, err = exporter.NewTelemetryExporter(ctx, k, initialTraceBuffer)
 		if err != nil {
-			slogger.Log(ctx, slog.LevelDebug,
+			slogger.Log(ctx, slog.LevelError,
 				"could not set up telemetry exporter",
 				"err", err,
 			)
@@ -276,6 +275,9 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 	// Now that log shipping is set up, set the slogger on the rungroup so that rungroup logs
 	// will also be shipped.
 	runGroup.SetSlogger(k.Slogger())
+
+	// Set slogger on initial trace buffer (in order to troubleshoot unexpected nil spans)
+	initialTraceBuffer.SetSlogger(k.Slogger())
 
 	startupSettingsWriter, err := startupsettings.OpenWriter(ctx, k)
 	if err != nil {
@@ -315,9 +317,13 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 	// The checkpointer can take up to 5 seconds to run, so do this in the background.
 	checkpointer := checkups.NewCheckupLogger(slogger, k)
 	gowrapper.Go(ctx, slogger, func() {
-		checkpointer.Once(ctx)
+		checkpointer.LogCheckupsOnStartup(ctx)
 	})
 	runGroup.Add("logcheckpoint", checkpointer.Run, checkpointer.Interrupt)
+
+	// Periodically check launcher performance
+	performanceMonitor := performancedebug.NewPerformanceMonitor(k)
+	runGroup.Add("performanceMonitor", performanceMonitor.Execute, performanceMonitor.Interrupt)
 
 	watchdogController, err := watchdog.NewController(ctx, k, opts.ConfigFilePath)
 	if err != nil { // log any issues here but move on, watchdog is not critical path
@@ -337,16 +343,15 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 	signalListener := newSignalListener(sigChannel, cancel, slogger)
 	runGroup.Add("sigChannel", signalListener.Execute, signalListener.Interrupt)
 
-	// For now, remediation is not performed -- we only log the hardware change. So we can
-	// perform this operation in the background to avoid slowing down launcher startup.
-	gowrapper.Go(ctx, slogger, func() {
-		agent.DetectAndRemediateHardwareChange(ctx, k)
-	})
+	// Add an actor to detect hardware changes. If a hardware change is detected (and remediation is enabled
+	// via feature flag), the actor will wipe launcher's database, then shut down to trigger a restart.
+	hardwareChangeDetector := agent.NewHardwareChangeDetector(k, slogger)
+	runGroup.Add("hardwareChangeDetector", hardwareChangeDetector.Execute, hardwareChangeDetector.Interrupt)
 
 	powerEventSubscriber := powereventwatcher.NewKnapsackSleepStateUpdater(slogger, k)
 	powerEventWatcher, err := powereventwatcher.New(ctx, slogger, powerEventSubscriber)
 	if err != nil {
-		slogger.Log(ctx, slog.LevelDebug,
+		slogger.Log(ctx, slog.LevelError,
 			"could not init power event watcher",
 			"err", err,
 		)
@@ -354,16 +359,12 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 		runGroup.Add("powerEventWatcher", powerEventWatcher.Execute, powerEventWatcher.Interrupt)
 	}
 
+	windowsUpdatesCacher := windowsupdatetable.NewWindowsUpdatesCacher(k, k.WindowsUpdatesCacheStore(), 1*time.Hour, k.Slogger())
+	runGroup.Add("windowsUpdatesCacher", windowsUpdatesCacher.Execute, windowsUpdatesCacher.Interrupt)
+
 	var client service.KolideService
 	{
 		switch k.Transport() {
-		case "grpc":
-			grpcConn, err := service.DialGRPC(k, rootPool)
-			if err != nil {
-				return fmt.Errorf("dialing grpc server: %w", err)
-			}
-			defer grpcConn.Close()
-			client = service.NewGRPCClient(k, grpcConn)
 		case "jsonrpc":
 			client = service.NewJSONRPCClient(k, rootPool)
 		case "osquery":
@@ -377,6 +378,11 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 	if err := agent.SetupKeys(ctx, k.Slogger(), k.ConfigStore()); err != nil {
 		return fmt.Errorf("setting up agent keys: %w", err)
 	}
+
+	// Now that the keys exist, collect and set enrollment details (which include the agent keys) in the background
+	gowrapper.Go(ctx, slogger, func() {
+		osquery.CollectAndSetEnrollmentDetails(ctx, slogger, k, 60*time.Second, 6*time.Second)
+	})
 
 	// init osquery instance history
 	if osqHistory, err := osqueryInstanceHistory.InitHistory(k.OsqueryHistoryInstanceStore()); err != nil {
@@ -497,7 +503,7 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 		}
 
 		if metadataWriter := internal.NewMetadataWriter(slogger, k); metadataWriter == nil {
-			slogger.Log(ctx, slog.LevelDebug,
+			slogger.Log(ctx, slog.LevelError,
 				"unable to set up metadata writer",
 				"err", err,
 			)
@@ -557,7 +563,6 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 			k,
 			metadataClient,
 			mirrorClient,
-			osqueryRunner,
 			tuf.WithOsqueryRestart(osqueryRunner.Restart),
 		)
 		if err != nil {

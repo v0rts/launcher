@@ -3,6 +3,7 @@ package tuf
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,34 +11,31 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Masterminds/semver"
 	"github.com/kolide/launcher/ee/agent/flags/keys"
-	"github.com/kolide/launcher/ee/agent/storage"
-	storageci "github.com/kolide/launcher/ee/agent/storage/ci"
-	"github.com/kolide/launcher/ee/agent/types"
 	typesmocks "github.com/kolide/launcher/ee/agent/types/mocks"
 	tufci "github.com/kolide/launcher/ee/tuf/ci"
 	"github.com/kolide/launcher/pkg/log/multislogger"
 	"github.com/kolide/launcher/pkg/threadsafebuffer"
 	mock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/theupdateframework/go-tuf/data"
 )
 
 func TestNewTufAutoupdater(t *testing.T) {
 	t.Parallel()
 
 	testRootDir := t.TempDir()
-	s := setupStorage(t)
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return("https://example.com")
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
@@ -46,9 +44,9 @@ func TestNewTufAutoupdater(t *testing.T) {
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
 	mockKnapsack.On("PinnedLauncherVersion").Return("")
 	mockKnapsack.On("PinnedOsquerydVersion").Return("")
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
 
-	_, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, newMockQuerier(t))
+	_, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient)
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 
 	// Confirm we pulled all config items as expected
@@ -74,11 +72,13 @@ func TestExecute_launcherUpdate(t *testing.T) {
 	testRootDir := t.TempDir()
 	testReleaseVersion := "1.2.3"
 	tufServerUrl, rootJson := tufci.InitRemoteTufServer(t, testReleaseVersion)
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyOlderBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
@@ -87,15 +87,14 @@ func TestExecute_launcherUpdate(t *testing.T) {
 	mockKnapsack.On("PinnedOsquerydVersion").Return("")
 	mockKnapsack.On("AutoupdateInterval").Return(500 * time.Millisecond)
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
 	mockKnapsack.On("LocalDevelopmentPath").Return("")
 	mockKnapsack.On("InModernStandby").Return(false)
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockQuerier := newMockQuerier(t)
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(0 * time.Second)
 
 	// Set logger so that we can capture output
 	var logBytes threadsafebuffer.ThreadSafeBuffer
@@ -103,7 +102,7 @@ func TestExecute_launcherUpdate(t *testing.T) {
 	mockKnapsack.On("Slogger").Return(slogger.Logger)
 
 	// Set up autoupdater
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier)
+	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient)
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 
 	// Update the metadata client with our test root JSON
@@ -121,8 +120,6 @@ func TestExecute_launcherUpdate(t *testing.T) {
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
 	currentLauncherVersion := "" // cannot determine using version package in test
-	currentOsqueryVersion := "1.1.1"
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": currentOsqueryVersion}}, nil)
 	mockLibraryManager.On("TidyLibrary", binaryOsqueryd, mock.Anything).Return().Once()
 
 	// Expect that we attempt to update the library
@@ -130,7 +127,7 @@ func TestExecute_launcherUpdate(t *testing.T) {
 	mockLibraryManager.On("Available", binaryOsqueryd, fmt.Sprintf("osqueryd-%s.tar.gz", testReleaseVersion)).Return(true).Maybe() // On subsequent iterations, no need to download again
 	mockLibraryManager.On("Available", binaryLauncher, fmt.Sprintf("launcher-%s.tar.gz", testReleaseVersion)).Return(false).Once()
 	mockLibraryManager.On("Available", binaryLauncher, fmt.Sprintf("launcher-%s.tar.gz", testReleaseVersion)).Return(true).Maybe() // On subsequent iterations, no need to download again
-	mockLibraryManager.On("AddToLibrary", binaryOsqueryd, currentOsqueryVersion, fmt.Sprintf("osqueryd-%s.tar.gz", testReleaseVersion), osquerydMetadata).Return(nil).Once()
+	mockLibraryManager.On("AddToLibrary", binaryOsqueryd, tufci.OlderBinaryVersion, fmt.Sprintf("osqueryd-%s.tar.gz", testReleaseVersion), osquerydMetadata).Return(nil).Once()
 	mockLibraryManager.On("AddToLibrary", binaryLauncher, currentLauncherVersion, fmt.Sprintf("launcher-%s.tar.gz", testReleaseVersion), launcherMetadata).Return(nil).Once()
 
 	// Let the autoupdater run for a bit -- it will shut itself down after a launcher update
@@ -175,11 +172,13 @@ func TestExecute_osquerydUpdate(t *testing.T) {
 	testRootDir := t.TempDir()
 	testReleaseVersion := "1.2.3"
 	tufServerUrl, rootJson := tufci.InitRemoteTufServer(t, testReleaseVersion)
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyOlderBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
@@ -188,14 +187,13 @@ func TestExecute_osquerydUpdate(t *testing.T) {
 	mockKnapsack.On("PinnedOsquerydVersion").Return("")
 	mockKnapsack.On("AutoupdateInterval").Return(100 * time.Millisecond) // Set the check interval to something short so we can make a couple requests to our test metadata server
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
 	mockKnapsack.On("InModernStandby").Return(false)
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
-	mockQuerier := newMockQuerier(t)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(0 * time.Second)
 
 	// Set logger so that we can capture output
 	var logBytes threadsafebuffer.ThreadSafeBuffer
@@ -203,8 +201,9 @@ func TestExecute_osquerydUpdate(t *testing.T) {
 	mockKnapsack.On("Slogger").Return(slogger.Logger)
 
 	// Set up autoupdater
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
+	autoupdater.osqueryTimeout = 5 * time.Second
 
 	// Update the metadata client with our test root JSON
 	require.NoError(t, autoupdater.metadataClient.Init(rootJson), "could not initialize metadata client with test root JSON")
@@ -218,18 +217,16 @@ func TestExecute_osquerydUpdate(t *testing.T) {
 	// Expect that we attempt to tidy the library first before running execute loop
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
-	currentOsqueryVersion := "1.1.1"
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": currentOsqueryVersion}}, nil)
 	mockLibraryManager.On("TidyLibrary", binaryOsqueryd, mock.Anything).Return().Once()
 
 	// Expect that we attempt to update the library
 	mockLibraryManager.On("Available", binaryOsqueryd, fmt.Sprintf("osqueryd-%s.tar.gz", testReleaseVersion)).Return(false)
 	mockLibraryManager.On("Available", binaryLauncher, fmt.Sprintf("launcher-%s.tar.gz", testReleaseVersion)).Return(true)
-	mockLibraryManager.On("AddToLibrary", binaryOsqueryd, currentOsqueryVersion, fmt.Sprintf("osqueryd-%s.tar.gz", testReleaseVersion), osquerydMetadata).Return(nil)
+	mockLibraryManager.On("AddToLibrary", binaryOsqueryd, tufci.OlderBinaryVersion, fmt.Sprintf("osqueryd-%s.tar.gz", testReleaseVersion), osquerydMetadata).Return(nil)
 
 	// Let the autoupdater run for a bit
 	go autoupdater.Execute()
-	time.Sleep(1000 * time.Millisecond)
+	time.Sleep(2 * autoupdater.osqueryTimeout)
 
 	// Assert expectation that we added the expected `testReleaseVersion` to the updates library
 	mockLibraryManager.AssertExpectations(t)
@@ -265,11 +262,13 @@ func TestExecute_downgrade(t *testing.T) {
 	testRootDir := t.TempDir()
 	testReleaseVersion := "3.22.9"
 	tufServerUrl, rootJson := tufci.InitRemoteTufServer(t, testReleaseVersion)
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
@@ -278,14 +277,12 @@ func TestExecute_downgrade(t *testing.T) {
 	mockKnapsack.On("PinnedOsquerydVersion").Return("")
 	mockKnapsack.On("AutoupdateInterval").Return(100 * time.Millisecond) // Set the check interval to something short so we can make a couple requests to our test metadata server
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
 	mockKnapsack.On("InModernStandby").Return(false)
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
-	mockQuerier := newMockQuerier(t)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
 
 	// Set logger so that we can capture output
 	var logBytes threadsafebuffer.ThreadSafeBuffer
@@ -293,7 +290,7 @@ func TestExecute_downgrade(t *testing.T) {
 	mockKnapsack.On("Slogger").Return(slogger.Logger)
 
 	// Set up autoupdater
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 
 	// Update the metadata client with our test root JSON
@@ -306,8 +303,6 @@ func TestExecute_downgrade(t *testing.T) {
 	// Expect that we attempt to tidy the library first before running execute loop
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
-	currentOsqueryVersion := "4.0.0"
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": currentOsqueryVersion}}, nil)
 	mockLibraryManager.On("TidyLibrary", binaryOsqueryd, mock.Anything).Return().Once()
 
 	// Expect that we do not attempt to update the library (i.e. the osquery update was previously downloaded)
@@ -362,19 +357,16 @@ func TestExecute_withInitialDelay(t *testing.T) {
 	testRootDir := t.TempDir()
 	testReleaseVersion := "1.2.3"
 	tufServerUrl, _ := tufci.InitRemoteTufServer(t, testReleaseVersion)
-	s := setupStorage(t)
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
 	mockKnapsack.On("AutoupdateInitialDelay").Return(initialDelay)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
 	mockKnapsack.On("UpdateChannel").Return("nightly")
 	mockKnapsack.On("PinnedLauncherVersion").Return("")
 	mockKnapsack.On("PinnedOsquerydVersion").Return("")
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockQuerier := newMockQuerier(t)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
 
 	// Set logger so that we can capture output
 	var logBytes threadsafebuffer.ThreadSafeBuffer
@@ -383,7 +375,7 @@ func TestExecute_withInitialDelay(t *testing.T) {
 
 	// Set up autoupdater
 	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient,
-		mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+		WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 
 	// Expect that we interrupt
@@ -421,17 +413,18 @@ func TestExecute_inModernStandby(t *testing.T) {
 	testRootDir := t.TempDir()
 	testReleaseVersion := "1.2.3"
 	tufServerUrl, _ := tufci.InitRemoteTufServer(t, testReleaseVersion)
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
 	mockKnapsack.On("AutoupdateInterval").Return(100 * time.Millisecond) // Set the check interval to something short so we can make a couple requests to our test metadata server
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
@@ -440,24 +433,24 @@ func TestExecute_inModernStandby(t *testing.T) {
 	mockKnapsack.On("PinnedOsquerydVersion").Return("")
 	mockKnapsack.On("InModernStandby").Return(true)
 	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
-	mockQuerier := newMockQuerier(t)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
 
 	// Set up autoupdater
 	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient,
-		mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+		WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
+	autoupdater.osqueryTimeout = 5 * time.Second
 
 	// Set up library manager: we should expect to tidy the library on startup, but NOT add anything to it
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": "5.6.7"}}, nil)
 	mockLibraryManager.On("TidyLibrary", binaryOsqueryd, mock.Anything).Return().Once()
 
-	// Let the autoupdater run for less than the initial delay
+	// Let the autoupdater run for long enough to make it through tidying the library (which includes an osquery version query)
+	// and at least starting an autoupdate check
 	go autoupdater.Execute()
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(2 * autoupdater.osqueryTimeout)
 
 	// Shut down the autoupdater
 	autoupdater.Interrupt(errors.New("test error"))
@@ -482,43 +475,50 @@ func TestInterrupt_Multiple(t *testing.T) {
 	})
 
 	testRootDir := t.TempDir()
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
 	mockKnapsack.On("AutoupdateInterval").Return(60 * time.Second)
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(testMetadataServer.URL)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
-	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
+	var logBytes threadsafebuffer.ThreadSafeBuffer
+	slogger := slog.New(slog.NewTextHandler(&logBytes, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	mockKnapsack.On("Slogger").Return(slogger)
 	mockKnapsack.On("UpdateChannel").Return("nightly")
 	mockKnapsack.On("PinnedLauncherVersion").Return("")
 	mockKnapsack.On("PinnedOsquerydVersion").Return("")
 	mockKnapsack.On("InModernStandby").Return(false)
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
-	mockQuerier := newMockQuerier(t)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
 
 	// Set up autoupdater
 	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient,
-		mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+		WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
+	autoupdater.osqueryTimeout = 5 * time.Second
 
 	// Set up normal library and querier interactions
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
 	mockLibraryManager.On("TidyLibrary", binaryOsqueryd, mock.Anything).Return().Once()
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": "1.1.1"}}, nil)
 
-	// Let the autoupdater run for a bit
+	// Let the autoupdater run for long enough to make it through tidying the library (which includes an osquery version query)
+	// and at least starting an autoupdate check
 	go autoupdater.Execute()
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(2 * autoupdater.osqueryTimeout)
+
+	interruptStart := time.Now()
 	autoupdater.Interrupt(errors.New("test error"))
 
 	// Confirm we can call Interrupt multiple times without blocking
@@ -542,7 +542,7 @@ func TestInterrupt_Multiple(t *testing.T) {
 			receivedInterrupts += 1
 			continue
 		case <-time.After(5 * time.Second):
-			t.Errorf("could not call interrupt multiple times and return within 5 seconds -- received %d interrupts before timeout", receivedInterrupts)
+			t.Errorf("could not call interrupt multiple times and return within 5 seconds -- interrupted at %s, received %d interrupts before timeout; logs: \n%s\n", interruptStart.String(), receivedInterrupts, logBytes.String())
 			t.FailNow()
 		}
 	}
@@ -618,11 +618,13 @@ func TestDo(t *testing.T) {
 			testRootDir := t.TempDir()
 			testReleaseVersion := "2.2.3"
 			tufServerUrl, rootJson := tufci.InitRemoteTufServer(t, testReleaseVersion)
-			s := setupStorage(t)
-			// setup fake osqueryd binary to mock file existence for currentRunningVersion
-			fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-			_, err := os.Create(fakeOsqBinaryPath)
-			require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+			// Set up osquery binary
+			osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+			if runtime.GOOS == "windows" {
+				osqBinaryPath += ".exe"
+			}
+			tufci.CopyOlderBinary(t, osqBinaryPath)
 
 			mockKnapsack := typesmocks.NewKnapsack(t)
 			mockKnapsack.On("RootDirectory").Return(testRootDir)
@@ -630,19 +632,16 @@ func TestDo(t *testing.T) {
 			mockKnapsack.On("PinnedLauncherVersion").Return("")
 			mockKnapsack.On("PinnedOsquerydVersion").Return("")
 			mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
-			mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 			mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 			mockKnapsack.On("UpdateDirectory").Return("")
 			mockKnapsack.On("MirrorServerURL").Return("https://example.com")
 			mockKnapsack.On("LocalDevelopmentPath").Return("").Maybe()
-			mockQuerier := newMockQuerier(t)
 			mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
 			mockKnapsack.On("InModernStandby").Return(false)
-			mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-			mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath).Maybe()
-
+			mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+			mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath).Maybe()
 			// Set up autoupdater
-			autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+			autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, WithOsqueryRestart(func(context.Context) error { return nil }))
 			require.NoError(t, err, "could not initialize new TUF autoupdater")
 
 			// Update the metadata client with our test root JSON
@@ -655,13 +654,9 @@ func TestDo(t *testing.T) {
 			// Expect that we attempt to update the library, only for the selected, valid binary/binaries
 			mockLibraryManager := NewMocklibrarian(t)
 			autoupdater.libraryManager = mockLibraryManager
-			currentOsqueryVersion := "1.1.1"
 			for _, b := range tt.updateData.BinariesToUpdate {
 				if b.Name != "osqueryd" && b.Name != "launcher" {
 					continue
-				}
-				if b.Name == "osqueryd" {
-					mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": currentOsqueryVersion}}, nil)
 				}
 
 				mockLibraryManager.On("Available", autoupdatableBinary(b.Name), fmt.Sprintf("%s-%s.tar.gz", b.Name, testReleaseVersion)).Return(false)
@@ -691,11 +686,13 @@ func TestDo_HandlesSimultaneousUpdates(t *testing.T) {
 	testRootDir := t.TempDir()
 	testReleaseVersion := "1.5.0"
 	tufServerUrl, rootJson := tufci.InitRemoteTufServer(t, testReleaseVersion)
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyOlderBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
@@ -705,19 +702,18 @@ func TestDo_HandlesSimultaneousUpdates(t *testing.T) {
 	interval := 500 * time.Millisecond
 	mockKnapsack.On("AutoupdateInterval").Return(interval)
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Millisecond)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
 	mockKnapsack.On("LocalDevelopmentPath").Return("")
 	mockKnapsack.On("InModernStandby").Return(false)
-	mockQuerier := newMockQuerier(t)
 	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(0 * time.Second)
 
 	// Set up autoupdater
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 
 	// Update the metadata client with our test root JSON
@@ -730,8 +726,6 @@ func TestDo_HandlesSimultaneousUpdates(t *testing.T) {
 	// Expect that we attempt to tidy the library first before running execute loop
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
-	currentOsqueryVersion := "1.1.1"
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": currentOsqueryVersion}}, nil)
 	mockLibraryManager.On("TidyLibrary", binaryOsqueryd, mock.Anything).Return().Once()
 
 	// Expect that we attempt to update the library, only for the selected binary/binaries
@@ -776,11 +770,13 @@ func TestDo_WillNotExecuteDuringInitialDelay(t *testing.T) {
 	testRootDir := t.TempDir()
 	testReleaseVersion := "1.5.0"
 	tufServerUrl, rootJson := tufci.InitRemoteTufServer(t, testReleaseVersion)
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyOlderBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
@@ -791,18 +787,16 @@ func TestDo_WillNotExecuteDuringInitialDelay(t *testing.T) {
 	mockKnapsack.On("AutoupdateInterval").Return(interval)
 	initialDelay := 1 * time.Second
 	mockKnapsack.On("AutoupdateInitialDelay").Return(initialDelay)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
-	mockQuerier := newMockQuerier(t)
 	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
 	mockKnapsack.On("InModernStandby").Return(false)
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
 
 	// Set up autoupdater
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 
 	// Update the metadata client with our test root JSON
@@ -815,8 +809,6 @@ func TestDo_WillNotExecuteDuringInitialDelay(t *testing.T) {
 	// Set up expectations for Execute function: tidying library, checking for updates
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
-	currentOsqueryVersion := "1.1.1"
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": currentOsqueryVersion}}, nil)
 	mockLibraryManager.On("TidyLibrary", binaryOsqueryd, mock.Anything).Return().Once()
 	autoupdater.libraryManager = mockLibraryManager
 	for _, b := range binaries {
@@ -858,34 +850,34 @@ func TestFlagsChanged_UpdateChannelChanged(t *testing.T) {
 	testRootDir := t.TempDir()
 	testReleaseVersion := "2.2.3"
 	tufServerUrl, rootJson := tufci.InitRemoteTufServer(t, testReleaseVersion)
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyOlderBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
 	mockKnapsack.On("LocalDevelopmentPath").Return("").Maybe()
-	mockQuerier := newMockQuerier(t)
 	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
 	mockKnapsack.On("PinnedLauncherVersion").Return("")
 	mockKnapsack.On("PinnedOsquerydVersion").Return("")
 	mockKnapsack.On("InModernStandby").Return(false)
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
 
 	// Start out on beta channel, then swap to nightly
 	mockKnapsack.On("UpdateChannel").Return("beta").Once()
 	mockKnapsack.On("UpdateChannel").Return("nightly")
 
 	// Set up autoupdater
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 	require.Equal(t, "beta", autoupdater.updateChannel)
 
@@ -899,8 +891,6 @@ func TestFlagsChanged_UpdateChannelChanged(t *testing.T) {
 	// Expect that we attempt to update the library
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
-	currentOsqueryVersion := "1.1.1"
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": currentOsqueryVersion}}, nil)
 	mockLibraryManager.On("Available", binaryOsqueryd, fmt.Sprintf("%s-%s.tar.gz", binaryOsqueryd, testReleaseVersion)).Return(false)
 	mockLibraryManager.On("AddToLibrary", binaryOsqueryd, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	mockLibraryManager.On("Available", binaryLauncher, fmt.Sprintf("%s-%s.tar.gz", binaryLauncher, testReleaseVersion)).Return(false)
@@ -925,34 +915,34 @@ func TestFlagsChanged_PinnedVersionChanged(t *testing.T) {
 	testRootDir := t.TempDir()
 	pinnedOsquerydVersion := "5.11.0"
 	tufServerUrl, rootJson := tufci.InitRemoteTufServer(t, pinnedOsquerydVersion)
-	s := setupStorage(t)
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(t.TempDir(), "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyOlderBinary(t, osqBinaryPath)
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return(tufServerUrl)
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
 	mockKnapsack.On("LocalDevelopmentPath").Return("").Maybe()
 	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
-	mockQuerier := newMockQuerier(t)
 	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
 	mockKnapsack.On("UpdateChannel").Return("nightly")
 	mockKnapsack.On("PinnedLauncherVersion").Return("")
 	mockKnapsack.On("InModernStandby").Return(false)
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
 
 	// Start out with no pinned version, then set a pinned version
 	mockKnapsack.On("PinnedOsquerydVersion").Return("").Once()
 	mockKnapsack.On("PinnedOsquerydVersion").Return(pinnedOsquerydVersion)
 
 	// Set up autoupdater
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 	require.Equal(t, "", autoupdater.pinnedVersions[binaryOsqueryd])
 
@@ -966,8 +956,6 @@ func TestFlagsChanged_PinnedVersionChanged(t *testing.T) {
 	// Expect that we attempt to update the library
 	mockLibraryManager := NewMocklibrarian(t)
 	autoupdater.libraryManager = mockLibraryManager
-	currentOsqueryVersion := "1.1.1"
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": currentOsqueryVersion}}, nil)
 	mockLibraryManager.On("Available", binaryOsqueryd, fmt.Sprintf("%s-%s.tar.gz", binaryOsqueryd, pinnedOsquerydVersion)).Return(false)
 	mockLibraryManager.On("AddToLibrary", binaryOsqueryd, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
@@ -988,7 +976,6 @@ func TestFlagsChanged_DuringInitialDelay(t *testing.T) {
 	t.Parallel()
 
 	testRootDir := t.TempDir()
-	s := setupStorage(t)
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	mockKnapsack.On("RootDirectory").Return(testRootDir)
 	mockKnapsack.On("UpdateChannel").Return("nightly")
@@ -997,13 +984,11 @@ func TestFlagsChanged_DuringInitialDelay(t *testing.T) {
 	mockKnapsack.On("AutoupdateInterval").Return(interval).Maybe()
 	initialDelay := 1 * time.Second
 	mockKnapsack.On("AutoupdateInitialDelay").Return(initialDelay)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(s)
 	mockKnapsack.On("TufServerURL").Return("https://example.com")
 	mockKnapsack.On("UpdateDirectory").Return("")
 	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
-	mockQuerier := newMockQuerier(t)
 	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
+	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay).Return()
 
 	// Start out with a pinned version, then unset the pinned version
 	pinnedLauncherVersion := "1.7.3"
@@ -1011,7 +996,7 @@ func TestFlagsChanged_DuringInitialDelay(t *testing.T) {
 	mockKnapsack.On("PinnedLauncherVersion").Return("")
 
 	// Set up autoupdater
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier, WithOsqueryRestart(func(context.Context) error { return nil }))
+	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, WithOsqueryRestart(func(context.Context) error { return nil }))
 	require.NoError(t, err, "could not initialize new TUF autoupdater")
 	require.Equal(t, pinnedLauncherVersion, autoupdater.pinnedVersions[binaryLauncher])
 
@@ -1033,10 +1018,8 @@ func TestFlagsChanged_DuringInitialDelay(t *testing.T) {
 func Test_currentRunningVersion_launcher_errorWhenVersionIsNotSet(t *testing.T) {
 	t.Parallel()
 
-	mockQuerier := newMockQuerier(t)
 	autoupdater := &TufAutoupdater{
-		slogger:   multislogger.NewNopLogger(),
-		osquerier: mockQuerier,
+		slogger: multislogger.NewNopLogger(),
 	}
 
 	// In test, version.Version() returns `unknown` for everything, which is not something
@@ -1049,24 +1032,27 @@ func Test_currentRunningVersion_launcher_errorWhenVersionIsNotSet(t *testing.T) 
 func Test_currentRunningVersion_osqueryd(t *testing.T) {
 	t.Parallel()
 
-	mockQuerier := newMockQuerier(t)
 	mockKnapsack := typesmocks.NewKnapsack(t)
 	testBinDir := t.TempDir()
-	fakeOsqBinaryPath := executableLocation(testBinDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
+
+	// Set up osquery binary
+	osqBinaryPath := filepath.Join(testBinDir, "osqueryd")
+	if runtime.GOOS == "windows" {
+		osqBinaryPath += ".exe"
+	}
+	tufci.CopyOlderBinary(t, osqBinaryPath)
+
+	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(osqBinaryPath)
 
 	autoupdater := &TufAutoupdater{
-		slogger:   multislogger.NewNopLogger(),
-		osquerier: mockQuerier,
-		knapsack:  mockKnapsack,
+		slogger:        multislogger.NewNopLogger(),
+		osqueryTimeout: 5 * time.Second,
+		knapsack:       mockKnapsack,
 	}
 
 	// Expect to return one row containing the version
-	expectedOsqueryVersion, err := semver.NewVersion("5.10.12")
+	expectedOsqueryVersion, err := semver.NewVersion(tufci.OlderBinaryVersion)
 	require.NoError(t, err)
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": expectedOsqueryVersion.Original()}}, nil).Once()
 
 	osqueryVersion, err := autoupdater.currentRunningVersion("osqueryd")
 	require.NoError(t, err, "expected no error fetching current running version of osqueryd")
@@ -1093,139 +1079,225 @@ func Test_currentRunningVersion_osqueryd_missing_binary(t *testing.T) {
 	require.Equal(t, "", osqueryVersion, "expected no current osquery version to be returned")
 }
 
-func Test_currentRunningVersion_osqueryd_handlesQueryError(t *testing.T) {
-	t.Parallel()
+//go:embed testdata/test_promote_time_target_files.json
+var sampleTargetJson []byte
 
-	mockQuerier := newMockQuerier(t)
-	autoupdater := &TufAutoupdater{
-		slogger:                multislogger.NewNopLogger(),
-		osquerier:              mockQuerier,
-		osquerierRetryInterval: 1 * time.Millisecond,
-	}
-
-	// Expect to return an error (five times, since we perform retries)
-	mockQuerier.On("Query", mock.Anything).Return(make([]map[string]string, 0), errors.New("test osqueryd querying error"))
-
-	osqueryVersion, err := autoupdater.currentRunningVersion("osqueryd")
-	require.Error(t, err, "expected an error returning osquery version when querying osquery fails")
-	require.Equal(t, "", osqueryVersion)
+func getSampleTargets(t *testing.T) data.TargetFiles {
+	var targetFiles data.TargetFiles
+	err := json.Unmarshal(sampleTargetJson, &targetFiles)
+	require.NoError(t, err, "expected to be able to unmarshal sample json into data.TargetFiles")
+	return targetFiles
 }
 
-func Test_storeError(t *testing.T) {
+func Test_findReleasePromoteTime(t *testing.T) {
 	t.Parallel()
 
-	testRootDir := t.TempDir()
-	testTufServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simulates TUF server being down
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer testTufServer.Close()
-	// setup fake osqueryd binary to mock file existence for currentRunningVersion
-	fakeOsqBinaryPath := executableLocation(testRootDir, "osqueryd")
-	_, err := os.Create(fakeOsqBinaryPath)
-	require.NoError(t, err, "unable to create fake osqueryd binary file for test setup")
+	// note that the sample targets file json is pre-curated so that the the promotion times
+	// match across OS and arch to simplify testing across platforms here
+	targets := getSampleTargets(t)
+	tests := []struct {
+		name                string
+		binary              autoupdatableBinary
+		channel             string
+		expectedPromoteTime int64
+	}{
+		{
+			name:                "osqueryd with valid alpha targets",
+			binary:              "osqueryd",
+			channel:             "alpha",
+			expectedPromoteTime: 1750955751,
+		},
+		{
+			name:                "osqueryd with valid nightly targets",
+			binary:              "osqueryd",
+			channel:             "nightly",
+			expectedPromoteTime: 1750870406,
+		},
+		{
+			name:                "osqueryd with valid stable targets",
+			binary:              "osqueryd",
+			channel:             "stable",
+			expectedPromoteTime: 1750954246,
+		},
+		{
+			// note that this is testing our zero value behavior,
+			// all beta targets are in the sample targets file are intentionally missing promote_time
+			name:                "osqueryd with missing beta target promotion times",
+			binary:              "osqueryd",
+			channel:             "beta",
+			expectedPromoteTime: 0,
+		},
+		{
+			name:                "launcher with valid alpha targets",
+			binary:              "launcher",
+			channel:             "alpha",
+			expectedPromoteTime: 1750961031,
+		},
+		{
+			name:                "launcher with valid nightly targets",
+			binary:              "launcher",
+			channel:             "nightly",
+			expectedPromoteTime: 1750859203,
+		},
+		{
+			name:                "launcher with valid stable targets",
+			binary:              "launcher",
+			channel:             "stable",
+			expectedPromoteTime: 1750955736,
+		},
+		{
+			// note that this is testing our zero value behavior,
+			// all beta targets are in the sample targets file are intentionally missing promote_time
+			name:                "launcher with missing beta target promotion times",
+			binary:              "launcher",
+			channel:             "beta",
+			expectedPromoteTime: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			promoteTime := findReleasePromoteTime(context.Background(), tt.binary, targets, tt.channel)
+			require.Equal(t, tt.expectedPromoteTime, promoteTime)
+		})
+	}
+}
+
+func Test_shouldDelayDownloadRespectsDisabledSplay(t *testing.T) {
+	t.Parallel()
 
 	mockKnapsack := typesmocks.NewKnapsack(t)
-	mockKnapsack.On("RootDirectory").Return(testRootDir)
-	mockKnapsack.On("AutoupdateInterval").Return(100 * time.Millisecond) // Set the check interval to something short so we can accumulate some errors
-	mockKnapsack.On("AutoupdateInitialDelay").Return(0 * time.Second)
-	mockKnapsack.On("AutoupdateErrorsStore").Return(setupStorage(t))
-	mockKnapsack.On("TufServerURL").Return(testTufServer.URL)
-	mockKnapsack.On("UpdateDirectory").Return("")
-	mockKnapsack.On("MirrorServerURL").Return("https://example.com")
-	mockKnapsack.On("Slogger").Return(multislogger.NewNopLogger())
-	mockKnapsack.On("UpdateChannel").Return("nightly")
-	mockKnapsack.On("PinnedLauncherVersion").Return("")
-	mockKnapsack.On("PinnedOsquerydVersion").Return("")
-	mockKnapsack.On("InModernStandby").Return(false)
-	mockKnapsack.On("RegisterChangeObserver", mock.Anything, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion).Return()
-	mockKnapsack.On("LatestOsquerydPath", mock.Anything).Return(fakeOsqBinaryPath)
-	mockQuerier := newMockQuerier(t)
-
-	autoupdater, err := NewTufAutoupdater(context.TODO(), mockKnapsack, http.DefaultClient, http.DefaultClient, mockQuerier)
-	require.NoError(t, err, "could not initialize new TUF autoupdater")
-
-	mockLibraryManager := NewMocklibrarian(t)
-	autoupdater.libraryManager = mockLibraryManager
-	mockQuerier.On("Query", mock.Anything).Return([]map[string]string{{"version": "1.1.1"}}, nil).Once()
-
-	// We only expect TidyLibrary to run for osqueryd, since we can't get the current running version
-	// for launcher in tests
-	mockLibraryManager.On("TidyLibrary", binaryOsqueryd, mock.Anything).Return().Once()
-
-	// Start the autoupdater going
-	go autoupdater.Execute()
-
-	// Wait 5 seconds to accumulate errors, stop it, and give it a second to shut down
-	time.Sleep(500 * time.Millisecond)
-	autoupdater.Interrupt(errors.New("test error"))
-	time.Sleep(100 * time.Millisecond)
-
-	// Confirm that we saved the errors
-	errorCount := 0
-	err = autoupdater.store.ForEach(func(k, _ []byte) error {
-		// Confirm error is saved with reasonable timestamp
-		ts, err := strconv.ParseInt(string(k), 10, 64)
-		require.NoError(t, err, "invalid timestamp in key: %s", string(k))
-		require.LessOrEqual(t, time.Now().Unix()-ts, int64(30), "error saved under timestamp not within last 30 seconds")
-
-		// Increment error count so we know we got something
-		errorCount += 1
-		return nil
-	})
-	require.NoError(t, err, "could not iterate over keys")
-	require.Greater(t, errorCount, 0, "TUF autoupdater did not record error counts")
-
-	mockLibraryManager.AssertExpectations(t)
-	mockQuerier.AssertExpectations(t)
-	mockKnapsack.AssertExpectations(t)
-}
-
-func Test_cleanUpOldErrors(t *testing.T) {
-	t.Parallel()
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(0 * time.Second)
 
 	autoupdater := &TufAutoupdater{
-		store:   setupStorage(t),
-		slogger: multislogger.NewNopLogger(),
+		slogger:              multislogger.NewNopLogger(),
+		knapsack:             mockKnapsack,
+		calculatedSplayDelay: &atomic.Int64{},
 	}
 
-	// Add one legitimate timestamp
-	oneHourAgo := time.Now().Add(-1 * time.Hour).Unix()
-	require.NoError(t, autoupdater.store.Set([]byte(fmt.Sprintf("%d", oneHourAgo)), []byte("{}")), "could not set recent timestamp for test")
-
-	// Add some old timestamps
-	eightDaysAgo := time.Now().Add(-8 * 24 * time.Hour).Unix()
-	require.NoError(t, autoupdater.store.Set([]byte(fmt.Sprintf("%d", eightDaysAgo)), []byte("{}")), "could not set old timestamp for test")
-	twoWeeksAgo := time.Now().Add(-14 * 24 * time.Hour).Unix()
-	require.NoError(t, autoupdater.store.Set([]byte(fmt.Sprintf("%d", twoWeeksAgo)), []byte("{}")), "could not set old timestamp for test")
-
-	// Add a malformed entry
-	require.NoError(t, autoupdater.store.Set([]byte("not a timestamp"), []byte("{}")), "could not set old timestamp for test")
-
-	// Confirm we added them
-	keyCountBeforeCleanup := 0
-	err := autoupdater.store.ForEach(func(_, _ []byte) error {
-		keyCountBeforeCleanup += 1
-		return nil
-	})
-	require.NoError(t, err, "could not iterate over keys")
-	require.Equal(t, 4, keyCountBeforeCleanup, "did not correctly seed errors in bucket")
-
-	// Call the cleanup function
-	autoupdater.cleanUpOldErrors()
-
-	keyCount := 0
-	err = autoupdater.store.ForEach(func(_, _ []byte) error {
-		keyCount += 1
-		return nil
-	})
-	require.NoError(t, err, "could not iterate over keys")
-
-	require.Equal(t, 1, keyCount, "cleanup routine did not clean up correct number of old errors")
+	require.False(t, autoupdater.shouldDelayDownload(autoupdatableBinary("osqueryd"), data.TargetFiles{}))
 }
 
-func setupStorage(t *testing.T) types.KVStore {
-	s, err := storageci.NewStore(t, multislogger.NewNopLogger(), storage.AutoupdateErrorsStore.String())
-	require.NoError(t, err)
-	return s
+func Test_shouldDelayDownloadDoesNotDelayWithoutPromoteTime(t *testing.T) {
+	t.Parallel()
+
+	mockKnapsack := typesmocks.NewKnapsack(t)
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(8 * time.Hour)
+
+	autoupdater := &TufAutoupdater{
+		slogger:              multislogger.NewNopLogger(),
+		knapsack:             mockKnapsack,
+		updateChannel:        "beta", // none of the beta targets have promote_time set
+		calculatedSplayDelay: &atomic.Int64{},
+	}
+
+	targets := getSampleTargets(t)
+	require.False(t, autoupdater.shouldDelayDownload(autoupdatableBinary("osqueryd"), targets))
+	require.False(t, autoupdater.shouldDelayDownload(autoupdatableBinary("launcher"), targets))
+}
+
+func Test_shouldDelayDownloadDoesNotDelayIfPromoteTimeExceedsSplay(t *testing.T) {
+	t.Parallel()
+
+	mockKnapsack := typesmocks.NewKnapsack(t)
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(2 * time.Hour)
+
+	autoupdater := &TufAutoupdater{
+		slogger:              multislogger.NewNopLogger(),
+		knapsack:             mockKnapsack,
+		updateChannel:        "alpha", // all promote_times in here will always be greater than 2 hours ago (splay time)
+		calculatedSplayDelay: &atomic.Int64{},
+	}
+
+	targets := getSampleTargets(t)
+	require.False(t, autoupdater.shouldDelayDownload(autoupdatableBinary("osqueryd"), targets))
+	require.False(t, autoupdater.shouldDelayDownload(autoupdatableBinary("launcher"), targets))
+}
+
+func Test_shouldDelayDownloadDelaysIfPromotedWithinSplay(t *testing.T) {
+	t.Parallel()
+
+	mockKnapsack := typesmocks.NewKnapsack(t)
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(8 * time.Hour)
+
+	autoupdater := &TufAutoupdater{
+		slogger:              multislogger.NewNopLogger(),
+		knapsack:             mockKnapsack,
+		updateChannel:        "alpha",
+		calculatedSplayDelay: &atomic.Int64{},
+	}
+
+	targets := getSampleTargets(t)
+	for _, binary := range []string{"osqueryd", "launcher"} {
+		// find the release file from samples and update the promote time to be within the splay time
+		targetReleaseFile := path.Join(binary, runtime.GOOS, PlatformArch(), autoupdater.updateChannel, "release.json")
+		existingTarget := targets[targetReleaseFile]
+		// setting promote time to be 5 minutes after splay time so there's no way it should not be delayed, regardless of uuid hash or seed
+		updatedPromote := fmt.Sprintf(`{"promote_time": %d}`, time.Now().Add(5*time.Minute).Unix())
+		newCustomMetadata := json.RawMessage([]byte(updatedPromote))
+		existingTarget.Custom = &newCustomMetadata
+		targets[targetReleaseFile] = existingTarget
+
+		require.True(t, autoupdater.shouldDelayDownload(autoupdatableBinary(binary), targets))
+	}
+}
+
+func Test_splayDelaySecondsReturnsConsistentDelay(t *testing.T) {
+	t.Parallel()
+
+	downloadSplayDuration := 8 * time.Hour
+	mockKnapsack := typesmocks.NewKnapsack(t)
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(downloadSplayDuration)
+
+	autoupdater := &TufAutoupdater{
+		slogger:              multislogger.NewNopLogger(),
+		knapsack:             mockKnapsack,
+		updateChannel:        "alpha",
+		calculatedSplayDelay: &atomic.Int64{},
+	}
+	initialDelay := autoupdater.getSplayDelaySeconds()
+
+	// initial delay should have a minimum value of 1,
+	// and should never exceed our AutoupdateDownloadSplay time in seconds
+	require.GreaterOrEqual(t, initialDelay, int64(1))
+	require.LessOrEqual(t, initialDelay, int64(downloadSplayDuration.Seconds()))
+
+	for range 3 {
+		require.Equal(t, initialDelay, autoupdater.getSplayDelaySeconds())
+	}
+}
+
+func Test_FlagsChangedAutoupdateDownloadSplayResetsCalculatedSplay(t *testing.T) {
+	t.Parallel()
+
+	downloadSplayDuration := 8 * time.Hour
+	mockKnapsack := typesmocks.NewKnapsack(t)
+	mockKnapsack.On("AutoupdateDownloadSplay").Return(downloadSplayDuration)
+	mockKnapsack.On("UpdateChannel").Return("alpha")
+
+	autoupdater := &TufAutoupdater{
+		slogger:              multislogger.NewNopLogger(),
+		knapsack:             mockKnapsack,
+		updateChannel:        "alpha",
+		calculatedSplayDelay: &atomic.Int64{},
+		pinnedVersions:       map[autoupdatableBinary]string{},
+	}
+	initialDelay := autoupdater.getSplayDelaySeconds()
+
+	// initial delay should have a minimum value of 1,
+	// and should never exceed our AutoupdateDownloadSplay time in seconds
+	require.GreaterOrEqual(t, initialDelay, int64(1))
+	require.LessOrEqual(t, initialDelay, int64(downloadSplayDuration.Seconds()))
+
+	autoupdater.FlagsChanged(context.TODO(), keys.AutoupdateDownloadSplay)
+	// verify that it was reset
+	require.Equal(t, int64(0), autoupdater.calculatedSplayDelay.Load())
+
+	// verify that it is repopulated on next read
+	newDelay := autoupdater.getSplayDelaySeconds()
+	require.GreaterOrEqual(t, newDelay, int64(1))
+	require.LessOrEqual(t, newDelay, int64(downloadSplayDuration.Seconds()))
 }

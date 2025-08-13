@@ -4,6 +4,7 @@
 package tuf
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -11,13 +12,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
-	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +28,7 @@ import (
 	"github.com/kolide/launcher/ee/agent/flags/keys"
 	"github.com/kolide/launcher/ee/agent/types"
 	"github.com/kolide/launcher/ee/observability"
+	"github.com/kolide/launcher/pkg/osquery/runsimple"
 	client "github.com/theupdateframework/go-tuf/client"
 	filejsonstore "github.com/theupdateframework/go-tuf/client/filejsonstore"
 	"github.com/theupdateframework/go-tuf/data"
@@ -55,7 +58,8 @@ var autoupdatableBinaryMap = map[string]autoupdatableBinary{
 }
 
 type ReleaseFileCustomMetadata struct {
-	Target string `json:"target"`
+	Target      string `json:"target"`
+	PromoteTime int64  `json:"promote_time"`
 }
 
 // Control server subsystem (used to send "update now" commands)
@@ -79,27 +83,22 @@ type librarian interface {
 	TidyLibrary(binary autoupdatableBinary, currentVersion string)
 }
 
-type querier interface {
-	Query(query string) ([]map[string]string, error)
-}
-
 type TufAutoupdater struct {
-	metadataClient         *client.Client
-	libraryManager         librarian
-	osquerier              querier // used to query for current running osquery version
-	osquerierRetryInterval time.Duration
-	knapsack               types.Knapsack
-	store                  types.KVStore // stores autoupdater errors for kolide_tuf_autoupdater_errors table
-	updateChannel          string
-	pinnedVersions         map[autoupdatableBinary]string        // maps the binaries to their pinned versions
-	pinnedVersionGetters   map[autoupdatableBinary]func() string // maps the binaries to the knapsack function to retrieve updated pinned versions
-	initialDelayEnd        time.Time
-	updateLock             *sync.Mutex
-	interrupt              chan struct{}
-	interrupted            atomic.Bool
-	signalRestart          chan error
-	slogger                *slog.Logger
-	restartFuncs           map[autoupdatableBinary]func(context.Context) error
+	metadataClient       *client.Client
+	libraryManager       librarian
+	osqueryTimeout       time.Duration
+	knapsack             types.Knapsack
+	updateChannel        string
+	pinnedVersions       map[autoupdatableBinary]string        // maps the binaries to their pinned versions
+	pinnedVersionGetters map[autoupdatableBinary]func() string // maps the binaries to the knapsack function to retrieve updated pinned versions
+	initialDelayEnd      time.Time
+	updateLock           *sync.Mutex
+	interrupt            chan struct{}
+	interrupted          atomic.Bool
+	signalRestart        chan error
+	slogger              *slog.Logger
+	restartFuncs         map[autoupdatableBinary]func(context.Context) error
+	calculatedSplayDelay *atomic.Int64 // the randomly selected delay within the download splay window
 }
 
 type TufAutoupdaterOption func(*TufAutoupdater)
@@ -114,15 +113,14 @@ func WithOsqueryRestart(restart func(context.Context) error) TufAutoupdaterOptio
 }
 
 func NewTufAutoupdater(ctx context.Context, k types.Knapsack, metadataHttpClient *http.Client, mirrorHttpClient *http.Client,
-	osquerier querier, opts ...TufAutoupdaterOption) (*TufAutoupdater, error) {
+	opts ...TufAutoupdaterOption) (*TufAutoupdater, error) {
 	ctx, span := observability.StartSpan(ctx)
 	defer span.End()
 
 	ta := &TufAutoupdater{
 		knapsack:      k,
-		interrupt:     make(chan struct{}, 1),
-		signalRestart: make(chan error, 1),
-		store:         k.AutoupdateErrorsStore(),
+		interrupt:     make(chan struct{}, 10), // We have a buffer so we don't block on sending to this channel
+		signalRestart: make(chan error, 10),    // We have a buffer so we don't block on sending to this channel
 		updateChannel: k.UpdateChannel(),
 		pinnedVersions: map[autoupdatableBinary]string{
 			binaryLauncher: k.PinnedLauncherVersion(), // empty string if not pinned
@@ -132,12 +130,12 @@ func NewTufAutoupdater(ctx context.Context, k types.Knapsack, metadataHttpClient
 			binaryLauncher: func() string { return k.PinnedLauncherVersion() },
 			binaryOsqueryd: func() string { return k.PinnedOsquerydVersion() },
 		},
-		initialDelayEnd:        time.Now().Add(k.AutoupdateInitialDelay()),
-		updateLock:             &sync.Mutex{},
-		osquerier:              osquerier,
-		osquerierRetryInterval: 30 * time.Second,
-		slogger:                k.Slogger().With("component", "tuf_autoupdater"),
-		restartFuncs:           make(map[autoupdatableBinary]func(context.Context) error),
+		initialDelayEnd:      time.Now().Add(k.AutoupdateInitialDelay()),
+		updateLock:           &sync.Mutex{},
+		osqueryTimeout:       30 * time.Second,
+		slogger:              k.Slogger().With("component", "tuf_autoupdater"),
+		restartFuncs:         make(map[autoupdatableBinary]func(context.Context) error),
+		calculatedSplayDelay: &atomic.Int64{},
 	}
 
 	for _, opt := range opts {
@@ -161,7 +159,7 @@ func NewTufAutoupdater(ctx context.Context, k types.Knapsack, metadataHttpClient
 	}
 
 	// Subscribe to changes in update-related flags
-	ta.knapsack.RegisterChangeObserver(ta, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion)
+	ta.knapsack.RegisterChangeObserver(ta, keys.UpdateChannel, keys.PinnedLauncherVersion, keys.PinnedOsquerydVersion, keys.AutoupdateDownloadSplay)
 
 	return ta, nil
 }
@@ -245,15 +243,14 @@ func (ta *TufAutoupdater) Execute() (err error) {
 
 	checkTicker := time.NewTicker(ta.knapsack.AutoupdateInterval())
 	defer checkTicker.Stop()
-	cleanupTicker := time.NewTicker(12 * time.Hour)
-	defer cleanupTicker.Stop()
 
 	for {
 		ta.slogger.Log(context.TODO(), slog.LevelInfo,
 			"checking for updates",
 		)
-		if err := ta.checkForUpdate(context.TODO(), binaries); err != nil {
-			ta.storeError(err)
+		// always allow our AutoupdateDownloadSplay delay during routine checks for autoupdates
+		if err := ta.checkForUpdate(context.TODO(), binaries, true); err != nil {
+			observability.AutoupdateFailureCounter.Add(context.TODO(), 1)
 			ta.slogger.Log(context.TODO(), slog.LevelError,
 				"error checking for update",
 				"err", err,
@@ -265,10 +262,6 @@ func (ta *TufAutoupdater) Execute() (err error) {
 		}
 
 		select {
-		case <-checkTicker.C:
-			continue
-		case <-cleanupTicker.C:
-			ta.cleanUpOldErrors()
 		case <-ta.interrupt:
 			ta.slogger.Log(context.TODO(), slog.LevelDebug,
 				"received external interrupt, stopping",
@@ -279,16 +272,17 @@ func (ta *TufAutoupdater) Execute() (err error) {
 				"received interrupt to restart launcher after update, stopping",
 			)
 			return signalRestartErr
+		case <-checkTicker.C:
+			continue
 		}
 	}
 }
 
 func (ta *TufAutoupdater) Interrupt(_ error) {
 	// Only perform shutdown tasks on first call to interrupt -- no need to repeat on potential extra calls.
-	if ta.interrupted.Load() {
+	if ta.interrupted.Swap(true) {
 		return
 	}
-	ta.interrupted.Store(true)
 
 	ta.interrupt <- struct{}{}
 }
@@ -343,8 +337,9 @@ func (ta *TufAutoupdater) Do(data io.Reader) error {
 		"binaries_to_update", fmt.Sprintf("%+v", binariesToUpdate),
 	)
 
-	if err := ta.checkForUpdate(ctx, binariesToUpdate); err != nil {
-		ta.storeError(err)
+	// do not allow AutoupdateDownloadSplay delay during autoupdate now requests
+	if err := ta.checkForUpdate(ctx, binariesToUpdate, false); err != nil {
+		observability.AutoupdateFailureCounter.Add(ctx, 1)
 		ta.slogger.Log(ctx, slog.LevelError,
 			"error checking for update per control server request",
 			"binaries_to_update", fmt.Sprintf("%+v", binariesToUpdate),
@@ -367,6 +362,13 @@ func (ta *TufAutoupdater) Do(data io.Reader) error {
 func (ta *TufAutoupdater) FlagsChanged(ctx context.Context, flagKeys ...keys.FlagKey) {
 	ctx, span := observability.StartSpan(ctx)
 	defer span.End()
+
+	// check if our autoupdate download splay has changed- if so,
+	// reset our internally stored value and our calculated splay delay so
+	// that it will be recalculated next time it is required
+	if slices.Contains(flagKeys, keys.AutoupdateDownloadSplay) {
+		ta.calculatedSplayDelay.Store(0)
+	}
 
 	binariesToCheckForUpdate := make([]autoupdatableBinary, 0)
 
@@ -404,8 +406,9 @@ func (ta *TufAutoupdater) FlagsChanged(ctx context.Context, flagKeys ...keys.Fla
 	}
 
 	// At least one binary requires a recheck -- perform that now
-	if err := ta.checkForUpdate(ctx, binariesToCheckForUpdate); err != nil {
-		ta.storeError(err)
+	// do not allow AutoupdateDownloadSplay delay when responding to flag changes
+	if err := ta.checkForUpdate(ctx, binariesToCheckForUpdate, false); err != nil {
+		observability.AutoupdateFailureCounter.Add(ctx, 1)
 		ta.slogger.Log(ctx, slog.LevelError,
 			"error checking for update after autoupdate setting changed",
 			"update_channel", ta.updateChannel,
@@ -454,32 +457,30 @@ func (ta *TufAutoupdater) currentRunningVersion(binary autoupdatableBinary) (str
 		}
 		return launcherVersion, nil
 	case binaryOsqueryd:
-		// first verify that the osqueryd binary exists. if it doesn't, there's no reason to wait
-		// for initialization below
-		if ta.knapsack != nil {
-			latestOsqdPath := ta.knapsack.LatestOsquerydPath(context.TODO())
-			if _, statErr := os.Stat(latestOsqdPath); os.IsNotExist(statErr) {
-				return "", fmt.Errorf("finding current running version: osqueryd binary does not exist at `%s`", latestOsqdPath)
-			}
+		// Query via runsimple instead of client to avoid any socket contention
+		ctx, cancel := context.WithTimeout(context.Background(), ta.osqueryTimeout)
+		defer cancel()
+
+		var output bytes.Buffer
+		osquerydPath := ta.knapsack.LatestOsquerydPath(ctx)
+		osqVersionProc, err := runsimple.NewOsqueryProcess(osquerydPath, runsimple.WithStdout(&output))
+		if err != nil {
+			return "", fmt.Errorf("creating runsimple process to query for osqueryd version: %w", err)
 		}
 
-		// The osqueryd client may not have initialized yet, so retry the version
-		// check a couple times before giving up
-		osquerydVersionCheckRetries := 5
-		var err error
-		for i := 0; i < osquerydVersionCheckRetries; i += 1 {
-			var resp []map[string]string
-			resp, err = ta.osquerier.Query("SELECT version FROM osquery_info;")
-			if err == nil && len(resp) > 0 {
-				if osquerydVersion, ok := resp[0]["version"]; ok {
-					return osquerydVersion, nil
-				}
-			}
-			err = fmt.Errorf("error querying for osquery_info: %w; rows returned: %d", err, len(resp))
-
-			time.Sleep(ta.osquerierRetryInterval)
+		if err := osqVersionProc.RunVersion(ctx); err != nil {
+			return "", fmt.Errorf("running runsimple to query for osqueryd version: %w", err)
 		}
-		return "", err
+
+		// Output looks like `osquery version x.y.z`, so split on `version` and return the last part of the string
+		outputStr := strings.TrimSpace(output.String())
+		parts := strings.SplitAfter(outputStr, "version")
+		if len(parts) < 2 {
+			return "", fmt.Errorf("malformed osqueryd version output %s", outputStr)
+		}
+		osquerydVersion := strings.TrimSpace(parts[len(parts)-1])
+
+		return osquerydVersion, nil
 	default:
 		return "", fmt.Errorf("cannot determine current running version for unexpected binary %s", binary)
 	}
@@ -487,7 +488,9 @@ func (ta *TufAutoupdater) currentRunningVersion(binary autoupdatableBinary) (str
 
 // checkForUpdate fetches latest metadata from the TUF server, then checks to see if there's
 // a new release that we should download. If so, it will add the release to our updates library.
-func (ta *TufAutoupdater) checkForUpdate(ctx context.Context, binariesToCheck []autoupdatableBinary) error {
+// If allowDelay is set to false, our knapsack.AutoupdateDownloadSplay will be ignored and the update
+// will be downloaded immediately, regardless of promotion time.
+func (ta *TufAutoupdater) checkForUpdate(ctx context.Context, binariesToCheck []autoupdatableBinary, allowDelay bool) error {
 	ctx, span := observability.StartSpan(ctx, "binaries", fmt.Sprintf("%+v", binariesToCheck))
 	defer span.End()
 
@@ -531,7 +534,7 @@ func (ta *TufAutoupdater) checkForUpdate(ctx context.Context, binariesToCheck []
 	updatesDownloaded := make(map[autoupdatableBinary]string)
 	updateErrors := make([]error, 0)
 	for _, binary := range binariesToCheck {
-		downloadedUpdateVersion, err := ta.downloadUpdate(binary, targets)
+		downloadedUpdateVersion, err := ta.downloadUpdate(binary, targets, allowDelay)
 		if err != nil {
 			updateErrors = append(updateErrors, fmt.Errorf("could not download update for %s: %w", binary, err))
 		}
@@ -594,8 +597,9 @@ func (ta *TufAutoupdater) checkForUpdate(ctx context.Context, binariesToCheck []
 }
 
 // downloadUpdate will download a new release for the given binary, if available from TUF
-// and not already downloaded.
-func (ta *TufAutoupdater) downloadUpdate(binary autoupdatableBinary, targets data.TargetFiles) (string, error) {
+// and not already downloaded. If allowDelay is true, the download may be delayed according to
+// the promotion time and the knapsack.AutoupdateDownloadSplay.
+func (ta *TufAutoupdater) downloadUpdate(binary autoupdatableBinary, targets data.TargetFiles, allowDelay bool) (string, error) {
 	target, targetMetadata, err := findTarget(context.Background(), binary, targets, ta.pinnedVersions[binary], ta.updateChannel, ta.slogger)
 	if err != nil {
 		return "", fmt.Errorf("could not find appropriate target: %w", err)
@@ -608,6 +612,8 @@ func (ta *TufAutoupdater) downloadUpdate(binary autoupdatableBinary, targets dat
 		return "", nil
 	}
 
+	// If the release is already available in our update library, there's no need to perform a download --
+	// we can immediately return to load the newly-selected version.
 	if ta.libraryManager.Available(binary, target) {
 		// The release is already available in the library but we don't know if we're running it --
 		// err on the side of not restarting.
@@ -622,7 +628,17 @@ func (ta *TufAutoupdater) downloadUpdate(binary autoupdatableBinary, targets dat
 
 		// The release is already available in the library and it's not our current running version --
 		// return the version to signal for a restart.
+		ta.slogger.Log(context.TODO(), slog.LevelInfo,
+			"update is already available in library",
+			"binary", binary,
+			"target", target,
+		)
 		return target, nil
+	}
+
+	// Determine whether we should skip this check cycle if delaying the download
+	if allowDelay && ta.shouldDelayDownload(binary, targets) {
+		return "", nil
 	}
 
 	// We haven't yet downloaded this release -- download it
@@ -717,6 +733,32 @@ func findRelease(ctx context.Context, binary autoupdatableBinary, targets data.T
 	return "", data.TargetFileMeta{}, fmt.Errorf("could not find metadata for release target %s for binary %s", releaseTarget, binary)
 }
 
+// findReleasePromoteTime extracts the promotion timestamp from the release file metadata for a given binary and channel.
+// It searches the TUF targets for the appropriate release.json file based on the binary, OS, architecture, and channel,
+// then unmarshals the custom metadata to retrieve the PromoteTime field.
+// Returns the Unix timestamp of when the release was promoted, or 0 if the release file is not found or cannot be parsed.
+func findReleasePromoteTime(ctx context.Context, binary autoupdatableBinary, targets data.TargetFiles, channel string) int64 {
+	_, span := observability.StartSpan(ctx)
+	defer span.End()
+
+	// find the metadata for the channel release file - this will include the promote_time
+	targetReleaseFile := path.Join(string(binary), runtime.GOOS, PlatformArch(), channel, "release.json")
+	for targetName, target := range targets {
+		if targetName != targetReleaseFile {
+			continue
+		}
+
+		var custom ReleaseFileCustomMetadata
+		if err := json.Unmarshal(*target.Custom, &custom); err != nil {
+			return 0
+		}
+
+		return custom.PromoteTime
+	}
+
+	return 0
+}
+
 // PlatformArch returns the correct arch for the runtime OS. For now, since osquery doesn't publish an arm64 release,
 // we use the universal binaries for darwin.
 func PlatformArch() string {
@@ -727,53 +769,76 @@ func PlatformArch() string {
 	return runtime.GOARCH
 }
 
-// storeError saves errors that occur during the periodic check for updates, so that they
-// can be queryable via the `kolide_tuf_autoupdater_errors` table.
-func (ta *TufAutoupdater) storeError(autoupdateErr error) {
-	timestamp := strconv.Itoa(int(time.Now().Unix()))
-	if err := ta.store.Set([]byte(timestamp), []byte(autoupdateErr.Error())); err != nil {
-		ta.slogger.Log(context.TODO(), slog.LevelError,
-			"could not store autoupdater error",
-			"err", err,
-		)
+// shouldDelayDownload determines whether to delay downloading an update based on our AutoupdateDownloadSplay mechanism.
+// It returns false (no delay) if:
+// - AutoupdateDownloadSplay is disabled (set to 0s)
+// - the release promote time cannot be determined or is unset
+// - the promotion happened longer ago than the configured splay duration
+// Otherwise, it uses a randomly selected delay offset within the splay window,
+// returning true if the current time is before the calculated delay cutoff.
+func (ta *TufAutoupdater) shouldDelayDownload(binary autoupdatableBinary, targets data.TargetFiles) bool {
+	// if the splay is disabled, we should always download immediately
+	if ta.knapsack.AutoupdateDownloadSplay() == 0 {
+		return false
 	}
+
+	slogger := ta.slogger.With(
+		"download_splay_minutes", ta.knapsack.AutoupdateDownloadSplay().Minutes(),
+		"binary", binary,
+		"update_channel", ta.updateChannel,
+	)
+
+	releasePromotedAt := findReleasePromoteTime(context.TODO(), binary, targets, ta.updateChannel)
+	// if for any reason we can't determine the promote time, we should download immediately.
+	// this also covers the case where we have not published a promote time for whatever reason
+	if releasePromotedAt == 0 {
+		slogger.Log(context.TODO(), slog.LevelDebug, "no release promotion time found, will not delay download")
+		return false
+	}
+
+	promoteStart := time.Unix(releasePromotedAt, 0)
+	// if promotion happened greater than our max splay threshold, we should download immediately
+	if time.Since(promoteStart) > ta.knapsack.AutoupdateDownloadSplay() {
+		slogger.Log(context.TODO(), slog.LevelDebug,
+			"promote start was longer ago than download splay, will not delay download",
+			"promote_start", promoteStart,
+		)
+		return false
+	}
+
+	splayDelaySeconds := ta.getSplayDelaySeconds()
+	delayCutoffTime := time.Unix(releasePromotedAt+splayDelaySeconds, 0)
+	slogger.Log(context.TODO(), slog.LevelInfo,
+		"release promoted within splay time, determining download eligibility",
+		"promote_start", promoteStart.UTC(),
+		"delay_seconds", splayDelaySeconds,
+		"delay_cutoff", delayCutoffTime.UTC(),
+		"delay_minutes_from_now", time.Until(delayCutoffTime).Minutes(),
+		"will_delay", time.Now().Before(delayCutoffTime),
+	)
+
+	// we should delay unless the current time is after the delay cutoff selected
+	return time.Now().Before(delayCutoffTime)
 }
 
-// cleanUpOldErrors removes all errors from our store that are more than a week old,
-// so we only keep the most recent/salient errors.
-func (ta *TufAutoupdater) cleanUpOldErrors() {
-	// We want to delete all errors more than 1 week old
-	errorTtl := 7 * 24 * time.Hour
-
-	// Read through all keys in bucket to determine which ones are old enough to be deleted
-	keysToDelete := make([][]byte, 0)
-	if err := ta.store.ForEach(func(k, _ []byte) error {
-		// Key is a timestamp
-		ts, err := strconv.ParseInt(string(k), 10, 64)
-		if err != nil {
-			// Delete the corrupted key
-			keysToDelete = append(keysToDelete, k)
-			return nil
-		}
-
-		errorTimestamp := time.Unix(ts, 0)
-		if errorTimestamp.Add(errorTtl).Before(time.Now()) {
-			keysToDelete = append(keysToDelete, k)
-		}
-
-		return nil
-	}); err != nil {
-		ta.slogger.Log(context.TODO(), slog.LevelWarn,
-			"could not iterate over bucket items to determine which are expired",
-			"err", err,
-		)
+// getSplayDelaySeconds returns a random delay value in seconds to indicate how long we should
+// wait after promotion_time before downloading the update.
+// This value is stable across a single launcher run- it uses a cached value if already calculated,
+// otherwise generates a new random value between 0 and the configured AutoupdateDownloadSplay duration in seconds.
+func (ta *TufAutoupdater) getSplayDelaySeconds() int64 {
+	currentValue := ta.calculatedSplayDelay.Load()
+	if currentValue != 0 {
+		return currentValue
 	}
 
-	// Delete all old keys
-	if err := ta.store.Delete(keysToDelete...); err != nil {
-		ta.slogger.Log(context.TODO(), slog.LevelWarn,
-			"could not delete old autoupdater errors from bucket",
-			"err", err,
-		)
+	maxSplayValue := int64(ta.knapsack.AutoupdateDownloadSplay().Seconds())
+	// we should never get here but no need to generate a random number if splay is disabled
+	if maxSplayValue == 0 {
+		return 0
 	}
+	// set a minimum of 1 second to ensure we don't set autoupdateDelaySplay to zero value
+	// and regenerate a new value on subsequent calls
+	newSplayValue := rand.Int63n(maxSplayValue) + 1
+	ta.calculatedSplayDelay.Store(newSplayValue)
+	return newSplayValue
 }

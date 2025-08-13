@@ -37,13 +37,16 @@ import (
 	"fmt"
 	"log/slog"
 
+	comshim "github.com/NozomiNetworks/go-comshim"
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
-	"github.com/scjalliance/comshim"
 )
 
-// S_FALSE is returned by CoInitializeEx if it was already called on this thread.
-const S_FALSE = 0x00000001
+const (
+	S_FALSE                        = 0x00000001 // S_FALSE is returned by CoInitializeEx if it was already called on this thread.
+	WBEM_FLAG_RETURN_WHEN_COMPLETE = 0          // https://learn.microsoft.com/en-us/windows/win32/wmisdk/swbemservices-execquery#parameters
+	WBEM_FLAG_FORWARD_ONLY         = 32
+)
 
 // querySettings contains various options. Mostly for the
 // connectServerArgs args. See
@@ -131,7 +134,10 @@ func Query(ctx context.Context, slogger *slog.Logger, className string, properti
 	queryString := fmt.Sprintf("SELECT * FROM %s%s", className, whereClause)
 
 	// Initialize the COM system.
-	comshim.Add(1)
+	if err := comshim.TryAdd(1); err != nil {
+		comshim.Done() // ensure we decrement the global shim counter that TryAdd increments immediately
+		return nil, fmt.Errorf("unable to init comshim: %w", err)
+	}
 	defer comshim.Done()
 
 	unknown, err := oleutil.CreateObject("WbemScripting.SWbemLocator")
@@ -170,10 +176,24 @@ func Query(ctx context.Context, slogger *slog.Logger, className string, properti
 		"query", queryString,
 	)
 
-	// result is a SWBemObjectSet
-	resultRaw, err := oleutil.CallMethod(service, "ExecQuery", queryString)
+	// ExecQuery runs semi-synchronously by default. To ensure we aren't missing any results,
+	// we prefer synchronous mode, which we achieve by setting iFlags to wbemFlagForwardOnly+wbemFlagReturnWhenComplete
+	// instead of the default wbemFlagReturnImmediately. (wbemFlagReturnWhenComplete will make the call synchronous,
+	// and wbemFlagForwardOnly helps us avoid any potential performance issues.) The flags values are not
+	// incredibly well-documented and there are multiple zero-value flags. We assume that wbemFlagForwardOnly (32)
+	// and wbemFlagBidirectional (0) are mutually exclusive, and that wbemFlagReturnImmediately (16) and
+	// wbemFlagReturnWhenComplete (0) are mutually exclusive. We assume, therefore, that WMI correctly understands
+	// an `iFlags` value of 32 as wbemFlagForwardOnly+wbemFlagReturnWhenComplete. (It cannot be understood as
+	// wbemFlagForwardOnly+wbemFlagBidirectional, because that is not a possible combination. It cannot be understood
+	// as wbemFlagForwardOnly only, because the return behavior flag must be set as either wbemFlagReturnWhenComplete or
+	// wbemFlagReturnImmediately.)
+	// See
+	// * https://learn.microsoft.com/en-us/windows/win32/wmisdk/calling-a-method#semisynchronous-mode.
+	// * https://learn.microsoft.com/en-us/windows/win32/wmisdk/swbemservices-execquery#parameters
+	// The result is a SWBemObjectSet.
+	resultRaw, err := oleutil.CallMethod(service, "ExecQuery", queryString, "WQL", WBEM_FLAG_FORWARD_ONLY+WBEM_FLAG_RETURN_WHEN_COMPLETE)
 	if err != nil {
-		return nil, fmt.Errorf("Running query %s: %w", queryString, err)
+		return nil, fmt.Errorf("running query `%s`: %w", queryString, err)
 	}
 	defer resultRaw.Clear()
 
