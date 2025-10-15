@@ -94,6 +94,14 @@ func InstanceDesktopProcessRecords() map[string]processRecord {
 	return instance.uidProcs
 }
 
+func InstanceDesktopAuthToken() string {
+	if instance == nil {
+		return ""
+	}
+
+	return instance.userServerAuthToken
+}
+
 // DesktopUsersProcessesRunner creates a launcher desktop process each time it detects
 // a new console (GUI) user. If the current console user's desktop process dies, it
 // will create a new one.
@@ -182,6 +190,8 @@ func New(k types.Knapsack, messenger runnerserver.Messenger, opts ...desktopUser
 
 	// Observe DesktopEnabled changes to know when to enable/disable process spawning
 	runner.knapsack.RegisterChangeObserver(runner, keys.DesktopEnabled)
+	// Observe DesktopGoMaxProcs changes to restart processes with new GOMAXPROCS limit
+	runner.knapsack.RegisterChangeObserver(runner, keys.DesktopGoMaxProcs)
 
 	rs, err := runnerserver.New(runner.slogger, k, messenger)
 	if err != nil {
@@ -536,6 +546,19 @@ func (r *DesktopUsersProcessesRunner) FlagsChanged(ctx context.Context, flagKeys
 	ctx, span := observability.StartSpan(ctx)
 	defer span.End()
 
+	// Handle DesktopGoMaxProcs changes
+	if slices.Contains(flagKeys, keys.DesktopGoMaxProcs) {
+		r.slogger.Log(ctx, slog.LevelInfo,
+			"desktop go max procs changed by control server, restarting desktop processes",
+			"new_value", r.knapsack.DesktopGoMaxProcs(),
+		)
+		// Kill existing processes so they restart with the new GOMAXPROCS limit
+		r.killDesktopProcesses(ctx)
+		// Note: processes will automatically restart on the next update interval
+		return
+	}
+
+	// Handle DesktopEnabled changes
 	if !slices.Contains(flagKeys, keys.DesktopEnabled) {
 		return
 	}
@@ -1007,6 +1030,8 @@ func (r *DesktopUsersProcessesRunner) desktopCommand(executablePath, uid, socket
 		fmt.Sprintf("WINDIR=%s", os.Getenv("WINDIR")),
 		// pass the desktop enabled flag so if it's already enabled, we show desktop immeadiately
 		fmt.Sprintf("DESKTOP_ENABLED=%v", r.knapsack.DesktopEnabled()),
+		// Set GOMAXPROCS for the desktop subprocess (Go respects this natively)
+		fmt.Sprintf("GOMAXPROCS=%d", r.knapsack.DesktopGoMaxProcs()),
 		"LAUNCHER_SKIP_UPDATES=true", // We already know that we want to run the version of launcher in `executablePath`, so there's no need to perform lookups
 	}
 
@@ -1181,4 +1206,65 @@ func (r *DesktopUsersProcessesRunner) checkOsUpdate() {
 		r.osVersion = currentOsVersion
 		r.killDesktopProcesses(context.Background())
 	}
+}
+
+// RequestProfile implements types.DesktopRunner
+func (r *DesktopUsersProcessesRunner) RequestProfile(ctx context.Context, profileType string) ([]string, error) {
+	if len(r.uidProcs) == 0 {
+		// No desktop processes running, this is not an error
+		return nil, nil
+	}
+
+	var profilePaths []string
+	var errs []error
+
+	for uid, proc := range r.uidProcs {
+		client := client.New(r.userServerAuthToken, proc.socketPath, client.WithTimeout(30*time.Second))
+
+		profilePath, err := client.RequestProfile(ctx, profileType)
+		if err != nil {
+			r.slogger.Log(ctx, slog.LevelWarn,
+				"failed to request profile from desktop process",
+				"uid", uid,
+				"pid", proc.Process.Pid,
+				"profile_type", profileType,
+				"err", err,
+			)
+			errs = append(errs, fmt.Errorf("desktop process %s: %w", uid, err))
+			continue
+		}
+
+		r.slogger.Log(ctx, slog.LevelDebug,
+			"successfully requested profile from desktop process",
+			"uid", uid,
+			"profile_type", profileType,
+			"file_path", profilePath,
+		)
+
+		profilePaths = append(profilePaths, profilePath)
+	}
+
+	// Return successfully collected profiles even if some failed
+	if len(profilePaths) > 0 {
+		if len(errs) > 0 {
+			r.slogger.Log(ctx, slog.LevelInfo,
+				"collected profiles with some failures",
+				"successful_count", len(profilePaths),
+				"failed_count", len(errs),
+			)
+		}
+		return profilePaths, nil
+	}
+
+	// All requests failed
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("all profile requests failed: %v", errs)
+	}
+
+	return nil, nil
+}
+
+// SetDesktopRunner implements types.DesktopRunner (no-op since this is the runner itself)
+func (r *DesktopUsersProcessesRunner) SetDesktopRunner(runner types.DesktopRunner) {
+	// No-op: this method is only used by the knapsack to store the runner reference
 }

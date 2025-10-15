@@ -203,6 +203,13 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 	flagController := flags.NewFlagController(slogger, stores[storage.AgentFlagsStore], fcOpts...)
 	k := knapsack.New(stores, flagController, db, multiSlogger, systemMultiSlogger)
 
+	// Set up GOMAXPROCS observer to watch for flag changes and apply them at runtime
+	gomaxprocsObs := newGomaxprocsObserver(slogger, k)
+	flagController.RegisterChangeObserver(gomaxprocsObs, keys.LauncherGoMaxProcs)
+
+	// Apply GOMAXPROCS limit from control flag
+	gomaxprocsLimiter(ctx, slogger, k.LauncherGoMaxProcs())
+
 	// Set up flag-driven dedup configuration on the main slogger
 	// (following the user's preference that early logs and system logs don't need deduplication)
 	multiSlogger.SetFlags(flagController)
@@ -395,6 +402,7 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 	// Now that the keys exist, collect and set enrollment details (which include the agent keys) in the background
 	gowrapper.Go(ctx, slogger, func() {
 		osquery.CollectAndSetEnrollmentDetails(ctx, slogger, k, 60*time.Second, 6*time.Second)
+		logShipper.Ping() // Let the logshipper know about the updated serial number
 	})
 
 	// init osquery instance history
@@ -453,6 +461,9 @@ func runLauncher(ctx context.Context, cancel func(), multiSlogger, systemMultiSl
 		if err != nil {
 			return fmt.Errorf("failed to create desktop runner: %w", err)
 		}
+
+		// Inject the desktop runner into the knapsack for profiling access
+		k.SetDesktopRunner(runner)
 
 		execute, interrupt, err := agent.SetHardwareKeysRunner(ctx, k.Slogger(), k.ConfigStore(), runner)
 		if err != nil {

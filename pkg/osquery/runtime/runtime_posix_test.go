@@ -38,6 +38,9 @@ func hasPermissionsToRunTest() bool {
 // out how to suspend and resume a process on Windows via golang.
 func TestOsquerySlowStart(t *testing.T) {
 	t.Parallel()
+	requirePermissions(t)
+	downloadOnceFunc()
+	setupOnceFunc()
 
 	rootDirectory := testRootDirectory(t)
 
@@ -50,7 +53,7 @@ func TestOsquerySlowStart(t *testing.T) {
 	k.On("RootDirectory").Return(rootDirectory).Maybe()
 	k.On("OsqueryVerbose").Return(true).Maybe()
 	k.On("OsqueryFlags").Return([]string{}).Maybe()
-	k.On("RegisterChangeObserver", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	k.On("RegisterChangeObserver", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	k.On("Slogger").Return(slogger)
 	k.On("LatestOsquerydPath", mock.Anything).Return(testOsqueryBinary)
 	k.On("LoggingInterval").Return(5 * time.Minute).Maybe()
@@ -104,6 +107,9 @@ func TestOsquerySlowStart(t *testing.T) {
 // This is only run on non-windows platforms because the extension socket path is semi random on windows.
 func TestExtensionSocketPath(t *testing.T) {
 	t.Parallel()
+	requirePermissions(t)
+	downloadOnceFunc()
+	setupOnceFunc()
 
 	rootDirectory := testRootDirectory(t)
 
@@ -113,7 +119,7 @@ func TestExtensionSocketPath(t *testing.T) {
 	k.On("RegistrationIDs").Return([]string{types.DefaultRegistrationID})
 	k.On("OsqueryHealthcheckStartupDelay").Return(0 * time.Second).Maybe()
 	k.On("WatchdogEnabled").Return(false)
-	k.On("RegisterChangeObserver", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	k.On("RegisterChangeObserver", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	k.On("Slogger").Return(slogger)
 	k.On("RootDirectory").Return(rootDirectory).Maybe()
 	k.On("OsqueryVerbose").Return(true).Maybe()
